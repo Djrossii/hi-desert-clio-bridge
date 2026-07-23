@@ -9,6 +9,13 @@ It speaks the Model Context Protocol (MCP) over HTTP, and internally talks
 to Clio's real REST API (v4), refreshing its own access token automatically
 using a long-lived refresh token.
 
+It also runs its own small OAuth 2.1 authorization server (with PKCE and
+dynamic client registration) — this is required because MCP clients like
+Cowork expect a remote HTTP MCP server to have a real "sign-in" flow, not
+just a static header. `BRIDGE_API_KEY` does double duty: it's the password
+you type once when Cowork prompts you to connect, and the signing secret
+for the tokens this server issues after that.
+
 ## What it needs to run
 
 Three Clio OAuth values (from the one-time authorization you already did):
@@ -44,23 +51,25 @@ variables on whatever host runs it, never committed to the repository.
 
 ## Wiring it into Claude
 
-Once deployed, the MCP endpoint is `https://<your-url>/mcp`, authenticated
-with a bearer token equal to `BRIDGE_API_KEY`. This gets registered as a
-remote HTTP-type MCP server, e.g.:
+Once deployed, register `https://<your-url>/mcp` as a remote HTTP-type MCP
+server:
 
 ```json
 {
   "mcpServers": {
     "clio-bridge": {
       "type": "http",
-      "url": "https://<your-url>/mcp",
-      "headers": {
-        "Authorization": "Bearer <BRIDGE_API_KEY value>"
-      }
+      "url": "https://<your-url>/mcp"
     }
   }
 }
 ```
+
+No `headers` needed — when Cowork tries to connect, it will discover this
+server's OAuth endpoints automatically, register itself, and open a small
+page asking for the **Bridge Access Key** (the `BRIDGE_API_KEY` value).
+Enter it once; Cowork stores and refreshes the resulting token on its own
+from then on.
 
 ## Tools it exposes
 

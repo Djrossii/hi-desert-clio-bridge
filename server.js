@@ -10,6 +10,8 @@
 // network-sandboxed Claude session. See README.md for deployment steps.
 
 import express from "express";
+import crypto from "node:crypto";
+import jwt from "jsonwebtoken";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -290,20 +292,237 @@ function buildServer() {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP layer — stateless Streamable HTTP transport, one MCP server instance
-// per request, protected by a static bearer token.
+// Minimal OAuth 2.1 authorization server (with PKCE + dynamic client
+// registration), just enough to satisfy MCP clients (like Cowork) that
+// expect a remote HTTP MCP server to have a real "sign-in service" rather
+// than a bare static header. There is exactly one real credential that
+// matters here — BRIDGE_API_KEY — which is used two ways:
+//   1. as the "password" a human must supply once at /oauth/authorize to
+//      approve a client, and
+//   2. as the HMAC signing secret for the access/refresh tokens we issue,
+//      so tokens stay verifiable across server restarts without needing a
+//      database (self-contained, JWT-style tokens).
 // ---------------------------------------------------------------------------
 
+function baseUrl(req) {
+  return `${req.protocol}://${req.get("host")}`;
+}
+
+function escapeHtml(s = "") {
+  return String(s).replace(
+    /[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+  );
+}
+
+// Short-lived, single-use authorization codes. In-memory is fine — the
+// authorize→token round trip happens within seconds, well within any host's
+// uptime window.
+const pendingCodes = new Map(); // code -> { redirectUri, codeChallenge, codeChallengeMethod, exp }
+const registeredClients = new Map(); // client_id -> registration info (informational only)
+
+function signAccessToken() {
+  return jwt.sign(
+    { sub: "hi-desert-law", type: "access", jti: crypto.randomUUID() },
+    BRIDGE_API_KEY,
+    { expiresIn: "1h" }
+  );
+}
+function signRefreshToken() {
+  return jwt.sign(
+    { sub: "hi-desert-law", type: "refresh", jti: crypto.randomUUID() },
+    BRIDGE_API_KEY,
+    { expiresIn: "180d" }
+  );
+}
+function verifyToken(token, expectedType) {
+  const payload = jwt.verify(token, BRIDGE_API_KEY);
+  if (payload.type !== expectedType) throw new Error("wrong token type");
+  return payload;
+}
+
 const app = express();
+app.set("trust proxy", true); // Render sits behind a proxy; needed for correct https:// detection
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 
+// --- OAuth discovery -------------------------------------------------------
+
+app.get("/.well-known/oauth-protected-resource", (req, res) => {
+  const base = baseUrl(req);
+  res.json({
+    resource: `${base}/mcp`,
+    authorization_servers: [base],
+  });
+});
+
+app.get("/.well-known/oauth-authorization-server", (req, res) => {
+  const base = baseUrl(req);
+  res.json({
+    issuer: base,
+    authorization_endpoint: `${base}/oauth/authorize`,
+    token_endpoint: `${base}/oauth/token`,
+    registration_endpoint: `${base}/oauth/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    code_challenge_methods_supported: ["S256", "plain"],
+    token_endpoint_auth_methods_supported: ["none"],
+    scopes_supported: ["clio"],
+  });
+});
+
+// --- Dynamic client registration (RFC 7591) --------------------------------
+// Accept any registrant — there's only ever one real client in practice
+// (Cowork's connector). The actual gate is the access-key prompt at
+// /oauth/authorize, not client identity.
+
+app.post("/oauth/register", (req, res) => {
+  const clientId = crypto.randomBytes(16).toString("hex");
+  const record = {
+    client_id: clientId,
+    client_id_issued_at: Math.floor(Date.now() / 1000),
+    redirect_uris: req.body?.redirect_uris ?? [],
+    token_endpoint_auth_method: "none",
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+    client_name: req.body?.client_name,
+  };
+  registeredClients.set(clientId, record);
+  res.status(201).json(record);
+});
+
+// --- Authorization endpoint (Authorization Code + PKCE) --------------------
+
+app.get("/oauth/authorize", (req, res) => {
+  const { response_type, client_id, redirect_uri, state, code_challenge, code_challenge_method } =
+    req.query;
+
+  if (response_type !== "code" || !redirect_uri || !code_challenge) {
+    res.status(400).send("Missing or invalid OAuth parameters.");
+    return;
+  }
+
+  res.type("html").send(`
+    <!doctype html>
+    <html>
+      <head><meta charset="utf-8"><title>Hi-Desert Law — Clio Bridge</title></head>
+      <body style="font-family: -apple-system, sans-serif; max-width: 420px; margin: 60px auto;">
+        <h2>Connect to the Clio Bridge</h2>
+        <p>Enter the Bridge Access Key to approve this connection.</p>
+        <form method="POST" action="/oauth/approve">
+          <input type="hidden" name="client_id" value="${escapeHtml(client_id ?? "")}">
+          <input type="hidden" name="redirect_uri" value="${escapeHtml(redirect_uri)}">
+          <input type="hidden" name="state" value="${escapeHtml(state ?? "")}">
+          <input type="hidden" name="code_challenge" value="${escapeHtml(code_challenge)}">
+          <input type="hidden" name="code_challenge_method" value="${escapeHtml(code_challenge_method ?? "S256")}">
+          <input type="password" name="key" placeholder="Bridge Access Key" autofocus
+                 style="width: 100%; padding: 8px; font-size: 14px; margin-bottom: 12px;">
+          <button type="submit" style="padding: 8px 16px; font-size: 14px;">Approve</button>
+        </form>
+      </body>
+    </html>
+  `);
+});
+
+app.post("/oauth/approve", (req, res) => {
+  const { key, redirect_uri, state, code_challenge, code_challenge_method } = req.body;
+
+  if (key !== BRIDGE_API_KEY) {
+    res.status(401).type("html").send("<p>Incorrect key. Go back and try again.</p>");
+    return;
+  }
+
+  const code = crypto.randomBytes(24).toString("hex");
+  pendingCodes.set(code, {
+    redirectUri: redirect_uri,
+    codeChallenge: code_challenge,
+    codeChallengeMethod: code_challenge_method || "S256",
+    exp: Date.now() + 5 * 60_000,
+  });
+
+  const url = new URL(redirect_uri);
+  url.searchParams.set("code", code);
+  if (state) url.searchParams.set("state", state);
+  res.redirect(302, url.toString());
+});
+
+// --- Token endpoint ----------------------------------------------------
+
+app.post("/oauth/token", (req, res) => {
+  const { grant_type } = req.body;
+
+  if (grant_type === "authorization_code") {
+    const { code, code_verifier } = req.body;
+    const entry = pendingCodes.get(code);
+    if (!entry || entry.exp < Date.now()) {
+      res.status(400).json({ error: "invalid_grant" });
+      return;
+    }
+    pendingCodes.delete(code); // single use
+
+    const challenge =
+      entry.codeChallengeMethod === "plain"
+        ? code_verifier
+        : crypto.createHash("sha256").update(code_verifier || "").digest("base64url");
+
+    if (!code_verifier || challenge !== entry.codeChallenge) {
+      res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
+      return;
+    }
+
+    res.json({
+      access_token: signAccessToken(),
+      token_type: "Bearer",
+      expires_in: 3600,
+      refresh_token: signRefreshToken(),
+    });
+    return;
+  }
+
+  if (grant_type === "refresh_token") {
+    try {
+      verifyToken(req.body.refresh_token, "refresh");
+    } catch {
+      res.status(400).json({ error: "invalid_grant" });
+      return;
+    }
+    res.json({
+      access_token: signAccessToken(),
+      token_type: "Bearer",
+      expires_in: 3600,
+      refresh_token: signRefreshToken(),
+    });
+    return;
+  }
+
+  res.status(400).json({ error: "unsupported_grant_type" });
+});
+
+// --- The actual MCP endpoint ------------------------------------------------
+
 app.post("/mcp", async (req, res) => {
   const auth = req.get("authorization") || "";
-  const expected = `Bearer ${BRIDGE_API_KEY}`;
-  if (auth !== expected) {
-    res.status(401).json({ error: "unauthorized" });
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  const base = baseUrl(req);
+
+  const authorized =
+    token === BRIDGE_API_KEY || // legacy/manual static-key use, still supported
+    (() => {
+      try {
+        verifyToken(token, "access");
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+
+  if (!authorized) {
+    res
+      .status(401)
+      .set("WWW-Authenticate", `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource"`)
+      .json({ error: "unauthorized" });
     return;
   }
 
