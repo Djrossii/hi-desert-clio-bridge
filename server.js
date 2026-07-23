@@ -222,9 +222,11 @@ function buildServer() {
       inputSchema: {
         matterId: z.number().int().describe("The Clio matter ID"),
         status: z
-          .enum(["open", "completed", "any"])
-          .default("open")
-          .describe("Restrict to tasks in this status; 'any' for all"),
+          .enum(["pending", "in_progress", "in_review", "complete", "draft", "any"])
+          .default("any")
+          .describe(
+            "Restrict to tasks in this Clio status (Clio's real status values, not a generic open/closed split); 'any' for all — 'any' is the safer default for duplicate-checking so an existing task isn't missed just because it's in_progress rather than pending."
+          ),
       },
     },
     async ({ matterId, status }) => {
