@@ -78,25 +78,35 @@ from then on.
 - `clio_get_matter(matterId)` — fetch one matter's details.
 - `clio_create_task(matterId, name, description?, assigneeId, priority?, dueAt?)`
   — create a Clio task.
+- `clio_list_tasks(matterId, status?)` — list a matter's existing tasks, so
+  an automation can check for duplicates before creating a new one.
+- `clio_update_task(taskId, name?, description?, priority?, dueAt?)` —
+  update an existing task instead of creating a duplicate.
 - `clio_update_matter(matterId, description?, customFields?)` — update a
   matter's description and/or named custom fields (e.g. "Case Number",
-  "Hearing Date on Petition"). This is what the eFiling watcher needs to
-  stop depending on Chrome.
+  "Hearing Date on Petition").
 
-## Which automations this can replace Chrome for
+## Which automations this covers, and how much
 
 - **Daily mailbox triage** — task creation + matter lookups (Part 3 of that
-  trigger's prompt). Fully covered.
-- **Court eFiling watcher** (hourly + late-afternoon runs) — case number /
-  matter description updates and correction-task creation. Fully covered
-  by `clio_update_matter` + `clio_create_task`; this trigger fires far more
-  often than the mailbox triage, so it's the bigger win once it's rewired.
-- **Daily court docket review** — only partially. Checking the actual court
-  website (San Bernardino Superior Court) still needs a browser; only the
-  trailing Clio custom-field write ("Hearing Date on Petition") moves to
-  the bridge.
+  trigger's prompt). Fully covered, migrated 7/23.
+- **Daily court docket review** — the two Clio writes (setting the "Hearing
+  Date on Petition" custom field, and creating an urgent task for new
+  filings, with a duplicate-check via `clio_list_tasks`) are fully covered.
+  Checking the actual court website (San Bernardino Superior Court) still
+  needs a browser — courts don't have APIs — so this trigger keeps Chrome
+  for that part regardless.
+- **Court eFiling watcher** (hourly + late-afternoon runs) — only the
+  "Case Number" custom-field update is covered. The larger part of this
+  trigger — downloading rejected PDFs, embedding signature images from
+  other filed documents, and re-uploading corrected forms — is real
+  document manipulation this bridge doesn't do, and rebuilding that
+  blind (against actual signed court filings) wasn't worth the risk.
+  This trigger keeps its Chrome/CSRF recipe for everything except the
+  case-number write.
 - **Weekly security audit** and the **copier-scan/signature monitor** —
-  not applicable; neither writes to Clio in a way this bridge covers.
+  not applicable; neither writes to Clio in a way this bridge covers
+  (confirmed by checking their prompts directly, not assumed).
 
 ## Local testing
 

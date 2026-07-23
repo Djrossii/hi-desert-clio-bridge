@@ -213,6 +213,64 @@ function buildServer() {
     }
   );
 
+  server.registerTool(
+    "clio_list_tasks",
+    {
+      title: "List a Clio matter's tasks",
+      description:
+        "List existing tasks on a matter, optionally filtered by status. Use this BEFORE creating a task to check whether an equivalent one already exists, so automations don't create duplicates.",
+      inputSchema: {
+        matterId: z.number().int().describe("The Clio matter ID"),
+        status: z
+          .enum(["open", "completed", "any"])
+          .default("open")
+          .describe("Restrict to tasks in this status; 'any' for all"),
+      },
+    },
+    async ({ matterId, status }) => {
+      const params = new URLSearchParams({
+        matter_id: String(matterId),
+        fields: "id,name,description,status,due_at,priority,assignee{name}",
+      });
+      if (status !== "any") params.set("status", status);
+      const data = await clioFetch(`/tasks.json?${params.toString()}`);
+      return {
+        content: [{ type: "text", text: JSON.stringify(data.data ?? [], null, 2) }],
+      };
+    }
+  );
+
+  server.registerTool(
+    "clio_update_task",
+    {
+      title: "Update a Clio task",
+      description:
+        "Update an existing Clio task's name, description, priority, or due date. Use this instead of clio_create_task when clio_list_tasks shows an equivalent task already exists — e.g. to append missing details rather than creating a duplicate.",
+      inputSchema: {
+        taskId: z.number().int().describe("The Clio task ID to update"),
+        name: z.string().max(255).optional().describe("New task title, if it should change"),
+        description: z
+          .string()
+          .optional()
+          .describe("New (or appended) description — replaces the existing description"),
+        priority: z.enum(["low", "normal", "high"]).optional(),
+        dueAt: z.string().optional().describe("New due date in YYYY-MM-DD format"),
+      },
+    },
+    async ({ taskId, name, description, priority, dueAt }) => {
+      const data = { id: taskId };
+      if (name !== undefined) data.name = name;
+      if (description !== undefined) data.description = description;
+      if (priority !== undefined) data.priority = priority;
+      if (dueAt !== undefined) data.due_at = dueAt;
+      const result = await clioFetch(`/tasks/${taskId}.json`, {
+        method: "PATCH",
+        body: JSON.stringify({ data }),
+      });
+      return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
+    }
+  );
+
   // In-memory cache of Clio's custom field definitions (id, name), refreshed
   // periodically — avoids an extra API round trip on every matter update.
   let customFieldsCache = null;
