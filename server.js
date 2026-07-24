@@ -113,7 +113,7 @@ async function clioFetch(path, options = {}) {
 function buildServer() {
   const server = new McpServer({
     name: "hi-desert-law-clio-bridge",
-    version: "0.1.0",
+    version: "0.2.0",
   });
 
   server.registerTool(
@@ -348,6 +348,164 @@ function buildServer() {
     }
   );
 
+  server.registerTool(
+    "clio_list_documents",
+    {
+      title: "List a Clio matter's documents",
+      description:
+        "List the documents already stored on a matter in Clio Manage, optionally filtered by a case-insensitive filename substring. Use this BEFORE clio_upload_document to check whether the file was already uploaded (possibly by another automation or a human), so duplicates aren't created.",
+      inputSchema: {
+        matterId: z.number().int().describe("The Clio matter ID"),
+        nameContains: z
+          .string()
+          .optional()
+          .describe(
+            "Only return documents whose filename contains this text (case-insensitive)"
+          ),
+      },
+    },
+    async ({ matterId, nameContains }) => {
+      const params = new URLSearchParams({
+        matter_id: String(matterId),
+        fields: "id,name,created_at,latest_document_version{fully_uploaded}",
+        page_size: "200",
+      });
+      const data = await clioFetch(`/documents.json?${params.toString()}`);
+      let docs = data.data ?? [];
+      if (nameContains) {
+        const needle = nameContains.toLowerCase();
+        docs = docs.filter((d) => (d.name ?? "").toLowerCase().includes(needle));
+      }
+      return { content: [{ type: "text", text: JSON.stringify(docs, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "clio_upload_document",
+    {
+      title: "Upload a document to a Clio matter",
+      description:
+        "Upload a file into Clio Manage's Documents tab on a specific matter. Provide the file EITHER as contentBase64 (small files only — a few hundred KB) OR as sourceUrl, an https URL this server fetches directly (use this for anything larger, e.g. a pre-authenticated OneDrive/Graph download URL). Call clio_list_documents first to avoid duplicates. Internally this runs Clio's three-step upload: create the document record, PUT the bytes to Clio's presigned bucket URL, then mark the version fully_uploaded.",
+      inputSchema: {
+        matterId: z.number().int().describe("The Clio matter ID to file the document under"),
+        fileName: z
+          .string()
+          .max(255)
+          .describe("Filename to store in Clio, including extension, e.g. 'CalVCB Letter (2026-07-08).pdf'"),
+        contentBase64: z
+          .string()
+          .optional()
+          .describe("The file's bytes, base64-encoded. Use only for small files; prefer sourceUrl otherwise."),
+        sourceUrl: z
+          .string()
+          .url()
+          .optional()
+          .describe(
+            "An https URL from which this server fetches the file bytes directly (e.g. a time-limited pre-authenticated download URL). Exactly one of contentBase64 / sourceUrl must be provided."
+          ),
+        receivedAt: z
+          .string()
+          .optional()
+          .describe("Date the document was received, YYYY-MM-DD, if known"),
+      },
+    },
+    async ({ matterId, fileName, contentBase64, sourceUrl, receivedAt }) => {
+      if (!contentBase64 === !sourceUrl) {
+        throw new Error("Provide exactly one of contentBase64 or sourceUrl.");
+      }
+
+      // --- obtain the bytes ---------------------------------------------
+      let bytes;
+      if (contentBase64) {
+        bytes = Buffer.from(contentBase64, "base64");
+      } else {
+        if (!/^https:\/\//i.test(sourceUrl)) {
+          throw new Error("sourceUrl must be an https:// URL.");
+        }
+        const resp = await fetch(sourceUrl, { redirect: "follow" });
+        if (!resp.ok) {
+          throw new Error(
+            `Fetching sourceUrl failed: ${resp.status} ${resp.statusText}`
+          );
+        }
+        bytes = Buffer.from(await resp.arrayBuffer());
+      }
+      if (!bytes.length) throw new Error("The file is empty — nothing to upload.");
+      const MAX = 100 * 1024 * 1024;
+      if (bytes.length > MAX) {
+        throw new Error(`File is ${bytes.length} bytes; the limit is 100 MB.`);
+      }
+
+      // --- step 1: create the document record, get the presigned PUT ----
+      const created = await clioFetch(
+        `/documents.json?fields=id,name,latest_document_version{uuid,put_url,put_headers}`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            data: {
+              name: fileName,
+              parent: { id: matterId, type: "Matter" },
+              ...(receivedAt ? { received_at: receivedAt } : {}),
+            },
+          }),
+        }
+      );
+      const doc = created.data;
+      const version = doc?.latest_document_version;
+      if (!version?.put_url) {
+        throw new Error(
+          `Clio did not return a put_url for the new document (got: ${JSON.stringify(created)}). The document record may exist in an un-uploaded state (id ${doc?.id}).`
+        );
+      }
+
+      // --- step 2: PUT the bytes to Clio's storage bucket ----------------
+      const putHeaders = {};
+      for (const h of version.put_headers ?? []) putHeaders[h.name] = h.value;
+      const putResp = await fetch(version.put_url, {
+        method: "PUT",
+        headers: putHeaders,
+        body: bytes,
+      });
+      if (!putResp.ok) {
+        const body = await putResp.text().catch(() => "");
+        throw new Error(
+          `Uploading bytes to Clio's storage failed: ${putResp.status} ${putResp.statusText} — ${body.slice(0, 500)}. Document record id ${doc.id} was created but is NOT fully uploaded.`
+        );
+      }
+
+      // --- step 3: mark the version fully uploaded -----------------------
+      const finalized = await clioFetch(
+        `/documents/${doc.id}.json?fields=id,name,latest_document_version{fully_uploaded}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({
+            data: { uuid: version.uuid, fully_uploaded: true },
+          }),
+        }
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                uploaded: true,
+                documentId: finalized.data?.id ?? doc.id,
+                name: finalized.data?.name ?? fileName,
+                bytes: bytes.length,
+                fully_uploaded:
+                  finalized.data?.latest_document_version?.fully_uploaded ?? null,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  );
+
   return server;
 }
 
@@ -403,7 +561,9 @@ function verifyToken(token, expectedType) {
 
 const app = express();
 app.set("trust proxy", true); // Render sits behind a proxy; needed for correct https:// detection
-app.use(express.json());
+// The 40mb limit exists for clio_upload_document's contentBase64 mode — the
+// default 100kb JSON body cap would reject any real document.
+app.use(express.json({ limit: "40mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));

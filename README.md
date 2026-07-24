@@ -85,6 +85,14 @@ from then on.
 - `clio_update_matter(matterId, description?, customFields?)` — update a
   matter's description and/or named custom fields (e.g. "Case Number",
   "Hearing Date on Petition").
+- `clio_list_documents(matterId, nameContains?)` — list a matter's existing
+  documents, so an automation can check for duplicates before uploading.
+- `clio_upload_document(matterId, fileName, contentBase64? | sourceUrl, receivedAt?)`
+  — upload a file into the matter's Documents tab. Small files can be sent
+  inline as base64; anything larger should be passed as an https `sourceUrl`
+  (e.g. a time-limited pre-authenticated download URL) that this server
+  fetches directly. Runs Clio's documented three-step upload (create record →
+  PUT to presigned bucket URL → mark `fully_uploaded`).
 
 ## Which automations this covers, and how much
 
@@ -104,9 +112,15 @@ from then on.
   blind (against actual signed court filings) wasn't worth the risk.
   This trigger keeps its Chrome/CSRF recipe for everything except the
   case-number write.
-- **Weekly security audit** and the **copier-scan/signature monitor** —
-  not applicable; neither writes to Clio in a way this bridge covers
-  (confirmed by checking their prompts directly, not assumed).
+- **Weekly security audit** — not applicable; it never writes to Clio.
+- **Copier-scan/signature monitor** — as of v0.2.0 (7/23/26), the bridge can
+  file scanned documents into a matter's Documents tab via
+  `clio_upload_document` (with a `clio_list_documents` duplicate check
+  first), closing the gap that previously forced "manual upload needed"
+  alerts. Note the practical constraint: an automation session can't
+  realistically inline multi-megabyte files as base64 in a tool call, so
+  for full scans it should pass a pre-authenticated download URL as
+  `sourceUrl` and let the bridge fetch the bytes itself.
 
 ## Local testing
 
