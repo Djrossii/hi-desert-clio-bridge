@@ -82,9 +82,14 @@ from then on.
   an automation can check for duplicates before creating a new one.
 - `clio_update_task(taskId, name?, description?, priority?, dueAt?)` —
   update an existing task instead of creating a duplicate.
-- `clio_update_matter(matterId, description?, customFields?)` — update a
-  matter's description and/or named custom fields (e.g. "Case Number",
+- `clio_update_matter(matterId, description?, status?, customFields?)` — update
+  a matter's description, status (open/pending/closed — supports the
+  closed-matter reopen rule), and/or named custom fields (e.g. "Case Number",
   "Hearing Date on Petition").
+- `clio_list_recent_tasks(status?, updatedSince?, assigneeId?, nameContains?)`
+  — list tasks firm-wide (across all matters), e.g. completions since the last
+  run, or outstanding "CLAUDE:" work orders. Built for the hourly
+  completed-task-review automation.
 - `clio_list_documents(matterId, nameContains?)` — list a matter's existing
   documents, so an automation can check for duplicates before uploading.
 - `clio_upload_document(matterId, fileName, contentBase64? | sourceUrl, receivedAt?)`

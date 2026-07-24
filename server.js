@@ -113,7 +113,7 @@ async function clioFetch(path, options = {}) {
 function buildServer() {
   const server = new McpServer({
     name: "hi-desert-law-clio-bridge",
-    version: "0.2.0",
+    version: "0.3.0",
   });
 
   server.registerTool(
@@ -309,13 +309,19 @@ function buildServer() {
     {
       title: "Update a Clio matter",
       description:
-        "Update a matter's description and/or one or more custom field values (e.g. 'Case Number', 'Hearing Date on Petition'). Only supply the fields you want to change — omitted fields are left alone. Custom field names must match Clio's existing field names exactly (case-insensitive).",
+        "Update a matter's description, status (open/pending/closed — e.g. reopen a closed matter before filing newly arrived documents, per the closed-matter reopen rule), and/or one or more custom field values (e.g. 'Case Number', 'Hearing Date on Petition'). Only supply the fields you want to change — omitted fields are left alone. Custom field names must match Clio's existing field names exactly (case-insensitive).",
       inputSchema: {
         matterId: z.number().int().describe("The Clio matter ID to update"),
         description: z
           .string()
           .optional()
           .describe("New matter description, if it should change"),
+        status: z
+          .enum(["open", "pending", "closed"])
+          .optional()
+          .describe(
+            "New matter status — use 'open' to reopen a closed matter before filing new documents to it"
+          ),
         customFields: z
           .array(
             z.object({
@@ -329,9 +335,10 @@ function buildServer() {
           .describe("Custom field values to set"),
       },
     },
-    async ({ matterId, description, customFields }) => {
+    async ({ matterId, description, status, customFields }) => {
       const data = { id: matterId };
       if (description !== undefined) data.description = description;
+      if (status !== undefined) data.status = status;
       if (customFields?.length) {
         data.custom_field_values = await Promise.all(
           customFields.map(async (cf) => ({
@@ -345,6 +352,55 @@ function buildServer() {
         body: JSON.stringify({ data }),
       });
       return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "clio_list_recent_tasks",
+    {
+      title: "List recent Clio tasks across ALL matters",
+      description:
+        "List tasks firm-wide (not scoped to one matter), filtered by status and/or how recently they were updated. Built for the completed-task-review automation: fetch tasks with status 'complete' updated since the last run to detect new completions, or status 'pending'/'in_progress' to scan outstanding tasks for 'CLAUDE:' work orders. Returns each task with its matter reference.",
+      inputSchema: {
+        status: z
+          .enum(["pending", "in_progress", "in_review", "complete", "draft", "any"])
+          .default("complete")
+          .describe("Clio task status to filter by; 'any' for all statuses"),
+        updatedSince: z
+          .string()
+          .optional()
+          .describe(
+            "ISO 8601 timestamp (e.g. 2026-07-23T08:00:00-07:00) — only return tasks updated at or after this moment. Use the state file's lastRun to fetch only what changed."
+          ),
+        assigneeId: z
+          .number()
+          .int()
+          .optional()
+          .describe("Restrict to tasks assigned to this Clio user ID"),
+        nameContains: z
+          .string()
+          .optional()
+          .describe(
+            "Only return tasks whose name contains this text (case-insensitive), e.g. 'CLAUDE:' or 'Approve for eFiling'"
+          ),
+      },
+    },
+    async ({ status, updatedSince, assigneeId, nameContains }) => {
+      const params = new URLSearchParams({
+        fields:
+          "id,name,description,status,due_at,completed_at,priority,updated_at,matter{id,display_number},assignee{id,name}",
+        page_size: "200",
+      });
+      if (status !== "any") params.set("status", status);
+      if (updatedSince) params.set("updated_since", updatedSince);
+      if (assigneeId !== undefined) params.set("assignee_id", String(assigneeId));
+      const data = await clioFetch(`/tasks.json?${params.toString()}`);
+      let tasks = data.data ?? [];
+      if (nameContains) {
+        const needle = nameContains.toLowerCase();
+        tasks = tasks.filter((t) => (t.name ?? "").toLowerCase().includes(needle));
+      }
+      return { content: [{ type: "text", text: JSON.stringify(tasks, null, 2) }] };
     }
   );
 
