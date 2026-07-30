@@ -113,7 +113,7 @@ async function clioFetch(path, options = {}) {
 function buildServer() {
   const server = new McpServer({
     name: "hi-desert-law-clio-bridge",
-    version: "0.3.0",
+    version: "0.4.0",
   });
 
   server.registerTool(
@@ -463,9 +463,17 @@ function buildServer() {
           .string()
           .optional()
           .describe("Date the document was received, YYYY-MM-DD, if known"),
+        expectedBytes: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            "The file's exact size in bytes as measured at the source. STRONGLY RECOMMENDED for contentBase64: large base64 payloads can corrupt in transit through a model context, and a corrupted payload often still decodes — this check rejects the upload BEFORE anything reaches Clio when the decoded size doesn't match."
+          ),
       },
     },
-    async ({ matterId, fileName, contentBase64, sourceUrl, receivedAt }) => {
+    async ({ matterId, fileName, contentBase64, sourceUrl, receivedAt, expectedBytes }) => {
       if (!contentBase64 === !sourceUrl) {
         throw new Error("Provide exactly one of contentBase64 or sourceUrl.");
       }
@@ -487,6 +495,12 @@ function buildServer() {
         bytes = Buffer.from(await resp.arrayBuffer());
       }
       if (!bytes.length) throw new Error("The file is empty — nothing to upload.");
+      if (expectedBytes !== undefined && bytes.length !== expectedBytes) {
+        throw new Error(
+          `Byte-verification failed: decoded ${bytes.length} bytes but expectedBytes is ${expectedBytes}. ` +
+            `The payload was corrupted in transit — nothing was uploaded to Clio. Re-send the file.`
+        );
+      }
       const MAX = 100 * 1024 * 1024;
       if (bytes.length > MAX) {
         throw new Error(`File is ${bytes.length} bytes; the limit is 100 MB.`);
@@ -556,6 +570,305 @@ function buildServer() {
               null,
               2
             ),
+          },
+        ],
+      };
+    }
+  );
+
+  server.registerTool(
+    "clio_create_time_entry",
+    {
+      title: "Create a Clio time entry",
+      description:
+        "Create a time entry (Activity of type TimeEntry) on a matter. Firm rule: time is ALWAYS captured on client work including phone calls, but marked non-billable unless the matter is a conservatorship (the firm only bills hourly on conservator cases). Pass hours as a decimal (0.1 = 6 minutes); the bridge converts to seconds for Clio.",
+      inputSchema: {
+        matterId: z.number().int().describe("The Clio matter ID the time was spent on"),
+        date: z.string().describe("Date the work was performed, YYYY-MM-DD"),
+        hours: z
+          .number()
+          .positive()
+          .max(24)
+          .describe("Time spent, in decimal hours (0.1 = 6 min). Round up to the nearest 0.1."),
+        description: z
+          .string()
+          .max(2000)
+          .describe(
+            "The time entry narrative, e.g. 'Telephone conference with client re trust account security.'"
+          ),
+        nonBillable: z
+          .boolean()
+          .default(true)
+          .describe(
+            "true for flat-fee matters (the default); false ONLY on conservatorship matters, which bill hourly"
+          ),
+        userId: z
+          .number()
+          .int()
+          .default(354525096)
+          .describe(
+            "Clio user ID who performed the work — DJ 354525096 (default), Jenn Coffey 357831845, Samantha Mayer 359200225, Tim Curr 358894135, Cynthia Barnette 359244492"
+          ),
+      },
+    },
+    async ({ matterId, date, hours, description, nonBillable, userId }) => {
+      const body = {
+        data: {
+          type: "TimeEntry",
+          date,
+          quantity: Math.round(hours * 3600), // Clio wants seconds
+          note: description,
+          non_billable: nonBillable,
+          matter: { id: matterId },
+          user: { id: userId },
+        },
+      };
+      const data = await clioFetch(
+        `/activities.json?fields=id,type,date,quantity,note,non_billable,matter{id,display_number},user{id,name}`,
+        { method: "POST", body: JSON.stringify(body) }
+      );
+      return { content: [{ type: "text", text: JSON.stringify(data.data, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "clio_search_contacts",
+    {
+      title: "Search Clio contacts",
+      description:
+        "Search Clio contacts by name, email address, or phone number. Use this to match an inbound caller's number or name to an existing contact BEFORE creating a new one — Clio's query matches phone numbers, so searching the last 10 digits of a caller ID usually finds the person. Returns each contact's phone numbers, emails, and type (Person/Company).",
+      inputSchema: {
+        query: z
+          .string()
+          .describe(
+            "Free-text search — a name ('Dawn Blevins'), email, or phone number. For phone matching, digits only works best, e.g. '7604031210'."
+          ),
+        type: z
+          .enum(["Person", "Company", "any"])
+          .default("any")
+          .describe("Restrict to persons or companies; 'any' for both"),
+      },
+    },
+    async ({ query, type }) => {
+      const params = new URLSearchParams({
+        query,
+        fields:
+          "id,name,first_name,last_name,type,title,primary_email_address,primary_phone_number,phone_numbers{name,number},email_addresses{name,address},company{id,name}",
+        page_size: "50",
+      });
+      if (type !== "any") params.set("type", type);
+      const data = await clioFetch(`/contacts.json?${params.toString()}`);
+      return {
+        content: [{ type: "text", text: JSON.stringify(data.data ?? [], null, 2) }],
+      };
+    }
+  );
+
+  server.registerTool(
+    "clio_create_contact",
+    {
+      title: "Create a Clio contact",
+      description:
+        "Create a new contact (Person or Company) in Clio. Firm rule (CHECK ALL SOURCES BEFORE STOPPING): a contact record should carry the fullest information findable — name, title, firm/company, phone, email, and mailing address — looked up from every available source, not just what one email or call provided. Always clio_search_contacts first to avoid duplicates.",
+      inputSchema: {
+        type: z.enum(["Person", "Company"]).describe("Contact type"),
+        name: z
+          .string()
+          .optional()
+          .describe("Company name — required when type is Company"),
+        firstName: z.string().optional().describe("First name — required when type is Person"),
+        lastName: z.string().optional().describe("Last name — required when type is Person"),
+        title: z.string().optional().describe("Job title, e.g. 'Paralegal'"),
+        companyId: z
+          .number()
+          .int()
+          .optional()
+          .describe("Existing Company contact ID to link this Person to"),
+        phone: z
+          .string()
+          .optional()
+          .describe("Primary phone number, e.g. '(760) 403-1210'"),
+        email: z.string().optional().describe("Primary email address"),
+        street: z.string().optional().describe("Mailing address street"),
+        city: z.string().optional(),
+        state: z.string().optional().describe("State/province, e.g. 'CA'"),
+        postalCode: z.string().optional(),
+        country: z.string().optional().describe("Defaults to United States when an address is given"),
+      },
+    },
+    async ({ type, name, firstName, lastName, title, companyId, phone, email, street, city, state, postalCode, country }) => {
+      if (type === "Company" && !name) throw new Error("Company contacts require 'name'.");
+      if (type === "Person" && !lastName) throw new Error("Person contacts require at least 'lastName'.");
+      const data = {
+        type,
+        ...(type === "Company" ? { name } : { first_name: firstName, last_name: lastName }),
+        ...(title ? { title } : {}),
+        ...(companyId ? { company: { id: companyId } } : {}),
+        ...(phone
+          ? { phone_numbers: [{ name: "Work", number: phone, default_number: true }] }
+          : {}),
+        ...(email
+          ? { email_addresses: [{ name: "Work", address: email, default_email: true }] }
+          : {}),
+        ...(street || city || postalCode
+          ? {
+              addresses: [
+                {
+                  name: "Work",
+                  street,
+                  city,
+                  province: state,
+                  postal_code: postalCode,
+                  country: country || "United States",
+                },
+              ],
+            }
+          : {}),
+      };
+      const result = await clioFetch(
+        `/contacts.json?fields=id,name,type,title,primary_phone_number,primary_email_address`,
+        { method: "POST", body: JSON.stringify({ data }) }
+      );
+      return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "clio_update_contact",
+    {
+      title: "Update a Clio contact",
+      description:
+        "Update an existing contact — add or correct title, company link, phone, email, or mailing address (e.g. curing a thin record per the CHECK-ALL-SOURCES rule). Only supplied fields change. NOTE: supplying phone/email/address REPLACES that list on the contact.",
+      inputSchema: {
+        contactId: z.number().int().describe("The Clio contact ID to update"),
+        title: z.string().optional(),
+        companyId: z.number().int().optional().describe("Company contact ID to link (Persons only)"),
+        phone: z.string().optional().describe("New primary phone number"),
+        email: z.string().optional().describe("New primary email address"),
+        street: z.string().optional(),
+        city: z.string().optional(),
+        state: z.string().optional(),
+        postalCode: z.string().optional(),
+        country: z.string().optional(),
+      },
+    },
+    async ({ contactId, title, companyId, phone, email, street, city, state, postalCode, country }) => {
+      const data = { id: contactId };
+      if (title !== undefined) data.title = title;
+      if (companyId !== undefined) data.company = { id: companyId };
+      if (phone !== undefined)
+        data.phone_numbers = [{ name: "Work", number: phone, default_number: true }];
+      if (email !== undefined)
+        data.email_addresses = [{ name: "Work", address: email, default_email: true }];
+      if (street || city || postalCode)
+        data.addresses = [
+          {
+            name: "Work",
+            street,
+            city,
+            province: state,
+            postal_code: postalCode,
+            country: country || "United States",
+          },
+        ];
+      const result = await clioFetch(
+        `/contacts/${contactId}.json?fields=id,name,type,title,primary_phone_number,primary_email_address`,
+        { method: "PATCH", body: JSON.stringify({ data }) }
+      );
+      return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "clio_log_communication",
+    {
+      title: "Log a communication (phone call or email) on a Clio matter",
+      description:
+        "Record a communication in Clio Manage's Communications tab — the proper home for a call log. For an inbound client call: senders = the client contact, receivers = the firm user who took the call. Put the call summary in 'body' (key points, action items); the full transcript belongs in an attached document via clio_upload_document, not here. Pair with clio_create_time_entry so the call's time is captured.",
+      inputSchema: {
+        matterId: z.number().int().describe("The Clio matter ID"),
+        type: z
+          .enum(["PhoneCommunication", "EmailCommunication"])
+          .default("PhoneCommunication")
+          .describe("Communication type"),
+        subject: z
+          .string()
+          .max(255)
+          .describe("Short subject, e.g. 'TC with client re trust account security'"),
+        body: z
+          .string()
+          .describe("The detailed note — summary, key points, action items, duration"),
+        date: z.string().describe("Date of the communication, YYYY-MM-DD"),
+        senderContactId: z
+          .number()
+          .int()
+          .optional()
+          .describe("Clio CONTACT id of the sender (e.g. the client on an inbound call)"),
+        senderUserId: z
+          .number()
+          .int()
+          .optional()
+          .describe("Clio USER id of the sender (e.g. the staff member on an outbound call)"),
+        receiverContactId: z
+          .number()
+          .int()
+          .optional()
+          .describe("Clio CONTACT id of the receiver (e.g. the client on an outbound call)"),
+        receiverUserId: z
+          .number()
+          .int()
+          .optional()
+          .describe("Clio USER id of the receiver (e.g. the staff member on an inbound call)"),
+      },
+    },
+    async ({ matterId, type, subject, body, date, senderContactId, senderUserId, receiverContactId, receiverUserId }) => {
+      const senders = [
+        ...(senderContactId ? [{ type: "Contact", id: senderContactId }] : []),
+        ...(senderUserId ? [{ type: "User", id: senderUserId }] : []),
+      ];
+      const receivers = [
+        ...(receiverContactId ? [{ type: "Contact", id: receiverContactId }] : []),
+        ...(receiverUserId ? [{ type: "User", id: receiverUserId }] : []),
+      ];
+      if (!senders.length || !receivers.length) {
+        throw new Error(
+          "A communication needs at least one sender and one receiver (contact and/or user IDs)."
+        );
+      }
+      const data = {
+        type,
+        subject,
+        body,
+        date,
+        matter: { id: matterId },
+        senders,
+        receivers,
+      };
+      const result = await clioFetch(
+        `/communications.json?fields=id,type,subject,date,matter{id,display_number}`,
+        { method: "POST", body: JSON.stringify({ data }) }
+      );
+      return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "clio_delete_document",
+    {
+      title: "Delete a Clio document (to trash)",
+      description:
+        "Move a document to Clio's trash — for corrupt uploads and superseded drafts, per the firm's superseded-document deletion rule (the replacement must already be uploaded and verified). NEVER delete filed/court-endorsed documents, signed originals, client-provided source documents, or anything of evidentiary value. Documents in Clio's trash are recoverable by a human for a limited time.",
+      inputSchema: {
+        documentId: z.number().int().describe("The Clio document ID to move to trash"),
+      },
+    },
+    async ({ documentId }) => {
+      await clioFetch(`/documents/${documentId}.json`, { method: "DELETE" });
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ deleted: true, documentId, note: "Moved to Clio trash." }),
           },
         ],
       };

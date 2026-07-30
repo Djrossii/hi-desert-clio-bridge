@@ -92,12 +92,35 @@ from then on.
   completed-task-review automation.
 - `clio_list_documents(matterId, nameContains?)` — list a matter's existing
   documents, so an automation can check for duplicates before uploading.
-- `clio_upload_document(matterId, fileName, contentBase64? | sourceUrl, receivedAt?)`
+- `clio_upload_document(matterId, fileName, contentBase64? | sourceUrl, receivedAt?, expectedBytes?)`
   — upload a file into the matter's Documents tab. Small files can be sent
   inline as base64; anything larger should be passed as an https `sourceUrl`
   (e.g. a time-limited pre-authenticated download URL) that this server
   fetches directly. Runs Clio's documented three-step upload (create record →
-  PUT to presigned bucket URL → mark `fully_uploaded`).
+  PUT to presigned bucket URL → mark `fully_uploaded`). Pass `expectedBytes`
+  (the file's true size) with any `contentBase64` upload: base64 payloads
+  can corrupt in transit through a model context, and this makes the bridge
+  reject a corrupted payload *before* anything reaches Clio (added v0.4.0
+  after a corrupt docx landed on a matter looking `fully_uploaded: true`).
+- `clio_create_time_entry(matterId, date, hours, description, nonBillable?, userId?)`
+  — create a real Clio time entry (Activity/TimeEntry). Hours are decimal
+  (0.1 = 6 min) and converted to seconds for Clio. Defaults to
+  `nonBillable: true` per the firm rule — time is always *captured*, but only
+  conservatorship matters bill hourly.
+- `clio_search_contacts(query, type?)` — find a contact by name, email, or
+  phone number (digits-only phone search works well for caller-ID matching).
+- `clio_create_contact(type, …)` — create a Person or Company contact with
+  title, company link, phone, email, and mailing address. Search first;
+  fill every field findable (CHECK-ALL-SOURCES rule).
+- `clio_update_contact(contactId, …)` — cure a thin contact record (add
+  title, firm, phone, email, address).
+- `clio_log_communication(matterId, type?, subject, body, date, sender…/receiver…)`
+  — record a phone call (or email) in the matter's Communications tab with
+  proper participants. This is the correct Clio home for call logs; pair
+  with `clio_create_time_entry`, and attach full transcripts as documents.
+- `clio_delete_document(documentId)` — move a document to Clio's trash, for
+  corrupt uploads and superseded drafts per the superseded-document deletion
+  rule. Never for filed/endorsed/signed/evidentiary documents.
 
 ## Which automations this covers, and how much
 
