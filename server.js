@@ -113,7 +113,7 @@ async function clioFetch(path, options = {}) {
 function buildServer() {
   const server = new McpServer({
     name: "hi-desert-law-clio-bridge",
-    version: "0.4.0",
+    version: "0.5.0",
   });
 
   server.registerTool(
@@ -159,7 +159,7 @@ function buildServer() {
     },
     async ({ matterId }) => {
       const data = await clioFetch(
-        `/matters/${matterId}.json?fields=id,display_number,description,status,client{name},open_date`
+        `/matters/${matterId}.json?fields=id,display_number,description,status,client{name},open_date,practice_area{name},custom_field_values{id,value,field_name}`
       );
       return { content: [{ type: "text", text: JSON.stringify(data.data, null, 2) }] };
     }
@@ -257,19 +257,44 @@ function buildServer() {
           .describe("New (or appended) description — replaces the existing description"),
         priority: z.enum(["low", "normal", "high"]).optional(),
         dueAt: z.string().optional().describe("New due date in YYYY-MM-DD format"),
+        status: z
+          .enum(["pending", "in_progress", "in_review", "complete"])
+          .optional()
+          .describe(
+            "New task status — 'complete' marks the task done (v0.5.0; removes the old browser-only limitation on completing tasks)"
+          ),
       },
     },
-    async ({ taskId, name, description, priority, dueAt }) => {
+    async ({ taskId, name, description, priority, dueAt, status }) => {
       const data = { id: taskId };
       if (name !== undefined) data.name = name;
       if (description !== undefined) data.description = description;
       if (priority !== undefined) data.priority = priority;
       if (dueAt !== undefined) data.due_at = dueAt;
+      if (status !== undefined) data.status = status;
       const result = await clioFetch(`/tasks/${taskId}.json`, {
         method: "PATCH",
         body: JSON.stringify({ data }),
       });
       return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "clio_delete_task",
+    {
+      title: "Delete a Clio task",
+      description:
+        "Permanently delete a Clio task by ID (v0.5.0). Use for stale tasks per the firm's clio-task-discipline rule — a task whose triggering event has passed or whose condition is cured is verified and DELETED. Verify the task really is stale (clio_list_tasks / matter records) before deleting; deletion is not reversible from the API.",
+      inputSchema: {
+        taskId: z.number().int().describe("The Clio task ID to delete"),
+      },
+    },
+    async ({ taskId }) => {
+      await clioFetch(`/tasks/${taskId}.json`, { method: "DELETE" });
+      return {
+        content: [{ type: "text", text: JSON.stringify({ deleted: true, taskId }) }],
+      };
     }
   );
 
@@ -340,11 +365,28 @@ function buildServer() {
       if (description !== undefined) data.description = description;
       if (status !== undefined) data.status = status;
       if (customFields?.length) {
+        // v0.5.0 fix for the long-standing 422 on populated fields: Clio
+        // requires the EXISTING custom_field_value id when updating a field
+        // that already holds a value (omitting it makes Clio try to create a
+        // duplicate value → 422). Read the matter's current values first and
+        // include the value id where one exists.
+        const existing = await clioFetch(
+          `/matters/${matterId}.json?fields=custom_field_values{id,value,custom_field}`
+        );
+        const existingValues = existing.data?.custom_field_values ?? [];
         data.custom_field_values = await Promise.all(
-          customFields.map(async (cf) => ({
-            custom_field: { id: await resolveCustomFieldId(cf.name) },
-            value: cf.value,
-          }))
+          customFields.map(async (cf) => {
+            const fieldId = await resolveCustomFieldId(cf.name);
+            const current = existingValues.find(
+              (v) => v.custom_field?.id === fieldId
+            );
+            const entry = {
+              custom_field: { id: fieldId },
+              value: cf.value,
+            };
+            if (current?.id) entry.id = current.id; // update-in-place, not create
+            return entry;
+          })
         );
       }
       const result = await clioFetch(`/matters/${matterId}.json`, {
@@ -352,6 +394,107 @@ function buildServer() {
         body: JSON.stringify({ data }),
       });
       return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "clio_relate_contact",
+    {
+      title: "Relate a contact to a matter",
+      description:
+        "Create a labeled relationship between an existing Clio contact and a matter (v0.5.0 — implements the firm's RELATED CONTACT ON DISCOVERY rule from headless sessions; removes the old Clio-UI-only limitation). The description is the relationship label, e.g. 'Heir', 'Beneficiary', 'Successor Trustee', 'Tenant (Defendant)', 'Opposing counsel — counsel for {party}'. Call clio_list_relationships first to avoid duplicates.",
+      inputSchema: {
+        matterId: z.number().int().describe("The Clio matter ID"),
+        contactId: z.number().int().describe("The Clio contact ID (from clio_search_contacts / clio_create_contact)"),
+        description: z
+          .string()
+          .max(255)
+          .describe("Relationship label shown on the matter, e.g. 'Heir', 'Tenant (Defendant)', 'Opposing counsel — counsel for John Doe'"),
+      },
+    },
+    async ({ matterId, contactId, description }) => {
+      const result = await clioFetch(`/relationships.json`, {
+        method: "POST",
+        body: JSON.stringify({
+          data: {
+            description,
+            matter: { id: matterId },
+            contact: { id: contactId },
+          },
+        }),
+      });
+      return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "clio_list_relationships",
+    {
+      title: "List a matter's related contacts",
+      description:
+        "List the contact relationships (related contacts with labels) on a Clio matter (v0.5.0). Use before clio_relate_contact to avoid duplicate relationships, and for the firm's related-contact sweeps.",
+      inputSchema: {
+        matterId: z.number().int().describe("The Clio matter ID"),
+      },
+    },
+    async ({ matterId }) => {
+      const params = new URLSearchParams({
+        matter_id: String(matterId),
+        fields: "id,description,contact{id,name}",
+        page_size: "200",
+      });
+      const data = await clioFetch(`/relationships.json?${params.toString()}`);
+      return {
+        content: [{ type: "text", text: JSON.stringify(data.data ?? [], null, 2) }],
+      };
+    }
+  );
+
+  server.registerTool(
+    "clio_list_activities",
+    {
+      title: "List activities (time entries) on a matter",
+      description:
+        "List the Activities (time entries and expenses) recorded on a Clio matter (v0.5.0). USE THIS FOR DEDUP before clio_create_time_entry when there is any chance the entry already exists — e.g. backlog remediation, retries after errors, or calls another session may have filed. Optionally filter by date.",
+      inputSchema: {
+        matterId: z.number().int().describe("The Clio matter ID"),
+        date: z
+          .string()
+          .optional()
+          .describe("Only return activities on this date (YYYY-MM-DD)"),
+      },
+    },
+    async ({ matterId, date }) => {
+      const params = new URLSearchParams({
+        matter_id: String(matterId),
+        fields: "id,type,date,quantity,note,non_billable,user{id,name}",
+        page_size: "200",
+        order: "date(asc)",
+      });
+      const data = await clioFetch(`/activities.json?${params.toString()}`);
+      let rows = data.data ?? [];
+      if (date) rows = rows.filter((a) => a.date === date);
+      return { content: [{ type: "text", text: JSON.stringify(rows, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "clio_delete_activity",
+    {
+      title: "Delete an activity (time entry)",
+      description:
+        "Permanently delete a Clio Activity (time entry) by ID (v0.5.0). ONLY for removing verified duplicates or erroneous entries created by automation — never delete a human-entered time entry without DJ's instruction. Call clio_list_activities first and verify the exact entry (id, date, note) before deleting.",
+      inputSchema: {
+        activityId: z.number().int().describe("The Clio activity (time entry) ID to delete"),
+      },
+    },
+    async ({ activityId }) => {
+      await clioFetch(`/activities/${activityId}.json`, { method: "DELETE" });
+      return {
+        content: [
+          { type: "text", text: JSON.stringify({ deleted: true, activityId }) },
+        ],
+      };
     }
   );
 

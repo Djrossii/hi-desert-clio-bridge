@@ -80,7 +80,7 @@ from then on.
   — create a Clio task.
 - `clio_list_tasks(matterId, status?)` — list a matter's existing tasks, so
   an automation can check for duplicates before creating a new one.
-- `clio_update_task(taskId, name?, description?, priority?, dueAt?)` —
+- `clio_update_task(taskId, name?, description?, priority?, dueAt?, status?)` —
   update an existing task instead of creating a duplicate.
 - `clio_update_matter(matterId, description?, status?, customFields?)` — update
   a matter's description, status (open/pending/closed — supports the
@@ -121,6 +121,24 @@ from then on.
 - `clio_delete_document(documentId)` — move a document to Clio's trash, for
   corrupt uploads and superseded drafts per the superseded-document deletion
   rule. Never for filed/endorsed/signed/evidentiary documents.
+
+### Added in v0.5.0 (8/2/2026)
+
+- `clio_delete_task(taskId)` — permanently delete a stale task (clio-task-discipline rule).
+- `clio_relate_contact(matterId, contactId, description)` — create a labeled
+  related-contact relationship on a matter (implements the RELATED CONTACT ON
+  DISCOVERY rule from headless sessions; previously Clio-UI-only).
+- `clio_list_relationships(matterId)` — list a matter's related contacts, for dedup.
+- `clio_list_activities(matterId, date?)` — list time entries on a matter, for
+  dedup before creating entries.
+- `clio_delete_activity(activityId)` — delete a duplicate/erroneous automation-created
+  time entry (verify with `clio_list_activities` first).
+- `clio_update_task` now accepts `status` (pending/in_progress/in_review/complete) —
+  tasks can be completed from headless sessions.
+- `clio_update_matter` custom-field writes now update-in-place (fixes the 422 on
+  fields that already hold a value, by including the existing value id).
+- `clio_get_matter` now returns practice area and custom field values (headless
+  sessions can READ custom fields).
 
 ## Which automations this covers, and how much
 
