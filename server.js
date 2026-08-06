@@ -113,7 +113,7 @@ async function clioFetch(path, options = {}) {
 function buildServer() {
   const server = new McpServer({
     name: "hi-desert-law-clio-bridge",
-    version: "0.5.0",
+    version: "0.6.0",
   });
 
   server.registerTool(
@@ -303,11 +303,11 @@ function buildServer() {
   let customFieldsCache = null;
   let customFieldsCacheAt = 0;
 
-  async function resolveCustomFieldId(fieldName) {
+  async function resolveCustomField(fieldName) {
     const now = Date.now();
     if (!customFieldsCache || now - customFieldsCacheAt > 10 * 60_000) {
       const data = await clioFetch(
-        `/custom_fields.json?fields=id,name,parent_type&page_size=200`
+        `/custom_fields.json?fields=id,name,parent_type,field_type&page_size=200`
       );
       customFieldsCache = data.data ?? [];
       customFieldsCacheAt = now;
@@ -326,7 +326,7 @@ function buildServer() {
             .join(", ")}`
       );
     }
-    return match.id;
+    return match;
   }
 
   server.registerTool(
@@ -334,7 +334,7 @@ function buildServer() {
     {
       title: "Update a Clio matter",
       description:
-        "Update a matter's description, status (open/pending/closed — e.g. reopen a closed matter before filing newly arrived documents, per the closed-matter reopen rule), and/or one or more custom field values (e.g. 'Case Number', 'Hearing Date on Petition'). Only supply the fields you want to change — omitted fields are left alone. Custom field names must match Clio's existing field names exactly (case-insensitive).",
+        "Update a matter's description, status (open/pending/closed — e.g. reopen a closed matter before filing newly arrived documents, per the closed-matter reopen rule), and/or one or more custom field values (e.g. 'Case Number', 'Hearing Date on Petition'). Only supply the fields you want to change — omitted fields are left alone. Custom field names must match Clio's existing field names exactly (case-insensitive). NOTE: Clio hard-limits Text (One-Line) custom fields (e.g. 'Property APN') to 255 characters — the bridge rejects longer values up front with a clear error (v0.6.0) instead of surfacing Clio's raw 422; put overflow detail in a HISTORY note or a Text (Multi-Line) field instead.",
       inputSchema: {
         matterId: z.number().int().describe("The Clio matter ID to update"),
         description: z
@@ -376,12 +376,23 @@ function buildServer() {
         const existingValues = existing.data?.custom_field_values ?? [];
         data.custom_field_values = await Promise.all(
           customFields.map(async (cf) => {
-            const fieldId = await resolveCustomFieldId(cf.name);
+            const field = await resolveCustomField(cf.name);
+            // v0.6.0: fail fast, clearly, on Clio's real 255-char ceiling for
+            // Text (One-Line) fields — previously this surfaced as a raw 422
+            // (hit live on the Property APN field, 8/5/26).
+            if (field.field_type === "text_line" && cf.value.length > 255) {
+              throw new Error(
+                `Value for custom field "${cf.name}" is ${cf.value.length} characters, but Clio ` +
+                  `limits Text (One-Line) fields to 255. Nothing was updated. Shorten the value ` +
+                  `(e.g. keep a summary here and put the full detail in the matter's HISTORY note ` +
+                  `via clio_update_note), or ask DJ to convert the field to Text (Multi-Line).`
+              );
+            }
             const current = existingValues.find(
-              (v) => v.custom_field?.id === fieldId
+              (v) => v.custom_field?.id === field.id
             );
             const entry = {
-              custom_field: { id: fieldId },
+              custom_field: { id: field.id },
               value: cf.value,
             };
             if (current?.id) entry.id = current.id; // update-in-place, not create
@@ -389,10 +400,24 @@ function buildServer() {
           })
         );
       }
-      const result = await clioFetch(`/matters/${matterId}.json`, {
-        method: "PATCH",
-        body: JSON.stringify({ data }),
-      });
+      let result;
+      try {
+        result = await clioFetch(`/matters/${matterId}.json`, {
+          method: "PATCH",
+          body: JSON.stringify({ data }),
+        });
+      } catch (err) {
+        // Keep the raw Clio error, but translate the known 422 shapes into
+        // something an automation can act on without guesswork.
+        if (/\b422\b/.test(String(err?.message)) && customFields?.length) {
+          throw new Error(
+            `${err.message} — HINT (bridge v0.6.0): a 422 on a custom-field write usually means ` +
+              `either (a) a value exceeds the field type's limit (Text One-Line caps at 255 chars), or ` +
+              `(b) Clio's picklist/date/format validation rejected the value. No fields were changed.`
+          );
+        }
+        throw err;
+      }
       return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
     }
   );
@@ -605,7 +630,9 @@ function buildServer() {
         receivedAt: z
           .string()
           .optional()
-          .describe("Date the document was received, YYYY-MM-DD, if known"),
+          .describe(
+            "Date the document was received, YYYY-MM-DD (or a full ISO-8601 datetime), if known. The bridge converts a bare date to the datetime Clio requires (v0.6.0 — previously a bare date drew a 422 'invalid xmlschema format')."
+          ),
         expectedBytes: z
           .number()
           .int()
@@ -650,6 +677,12 @@ function buildServer() {
       }
 
       // --- step 1: create the document record, get the presigned PUT ----
+      // Clio's received_at is an xmlschema DATETIME; a bare YYYY-MM-DD draws a
+      // 422. Promote bare dates to noon UTC (same calendar date in Pacific).
+      const receivedAtIso =
+        receivedAt && /^\d{4}-\d{2}-\d{2}$/.test(receivedAt)
+          ? `${receivedAt}T12:00:00Z`
+          : receivedAt;
       const created = await clioFetch(
         `/documents.json?fields=id,name,latest_document_version{uuid,put_url,put_headers}`,
         {
@@ -658,7 +691,7 @@ function buildServer() {
             data: {
               name: fileName,
               parent: { id: matterId, type: "Matter" },
-              ...(receivedAt ? { received_at: receivedAt } : {}),
+              ...(receivedAtIso ? { received_at: receivedAtIso } : {}),
             },
           }),
         }
@@ -709,6 +742,119 @@ function buildServer() {
                 bytes: bytes.length,
                 fully_uploaded:
                   finalized.data?.latest_document_version?.fully_uploaded ?? null,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  );
+
+  server.registerTool(
+    "clio_get_document_download_url",
+    {
+      title: "Get a time-limited download URL for a Clio document",
+      description:
+        "Mint a short-lived, pre-authenticated download URL for a document already stored in Clio Manage, so the bytes can be pulled OUT of Clio (e.g. into the OneDrive matter folder via the Clio Download Bridge Power Automate flow) without any caller needing a Clio credential. This is the reverse of clio_upload_document. Returns the document's name and exact byte size alongside the URL — always pass that byte size to the consumer as expectedBytes so the transfer can be byte-verified. The URL is issued by Clio's storage layer and expires quickly (minutes); fetch it promptly and do not log, email, or persist it. For small files you may instead pass inline:true to get the bytes as base64 directly.",
+      inputSchema: {
+        documentId: z
+          .number()
+          .int()
+          .describe("The Clio document ID (from clio_list_documents)"),
+        inline: z
+          .boolean()
+          .optional()
+          .describe(
+            "If true, return the bytes as base64 instead of a URL. ONLY for files under ~35 KB — larger payloads corrupt in transit through a model context. Defaults to false."
+          ),
+      },
+    },
+    async ({ documentId, inline = false }) => {
+      // --- metadata first: name + exact size, for byte-verification --------
+      const meta = await clioFetch(
+        `/documents/${documentId}.json?fields=id,name,size,content_type,latest_document_version{fully_uploaded}`
+      );
+      const doc = meta.data;
+      if (!doc) throw new Error(`Clio returned no document for id ${documentId}.`);
+      if (doc.latest_document_version?.fully_uploaded === false) {
+        throw new Error(
+          `Document ${documentId} ("${doc.name}") is not fully uploaded in Clio — refusing to hand out a download URL for a partial file.`
+        );
+      }
+
+      const token = await getAccessToken();
+      const dlPath = `${CLIO_API_BASE}/documents/${documentId}/download`;
+
+      if (inline) {
+        const resp = await fetch(dlPath, {
+          headers: { Authorization: `Bearer ${token}` },
+          redirect: "follow",
+        });
+        if (!resp.ok) {
+          throw new Error(
+            `Clio download failed: ${resp.status} ${resp.statusText}`
+          );
+        }
+        const buf = Buffer.from(await resp.arrayBuffer());
+        const INLINE_MAX = 35 * 1024;
+        if (buf.length > INLINE_MAX) {
+          throw new Error(
+            `Document ${documentId} is ${buf.length} bytes — too large for inline mode (ceiling ${INLINE_MAX}). Call again without inline to get a download URL and use the Clio Download Bridge.`
+          );
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  documentId,
+                  name: doc.name,
+                  bytes: buf.length,
+                  mode: "inline",
+                  contentBase64: buf.toString("base64"),
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      // --- redirect: "manual" so we can capture the presigned Location -----
+      const resp = await fetch(dlPath, {
+        headers: { Authorization: `Bearer ${token}` },
+        redirect: "manual",
+      });
+
+      const location = resp.headers.get("location");
+      if (!location) {
+        throw new Error(
+          `Clio did not return a redirect for document ${documentId} (status ${resp.status}). ` +
+            `The storage layer may have changed; inline mode still works for small files.`
+        );
+      }
+      if (!/^https:\/\//i.test(location)) {
+        throw new Error("Clio returned a non-https download location — refusing to use it.");
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                documentId,
+                name: doc.name,
+                bytes: doc.size ?? null,
+                contentType: doc.content_type ?? null,
+                mode: "url",
+                downloadUrl: location,
+                note:
+                  "Time-limited presigned URL — fetch promptly, do not log or persist it. Pass `bytes` to the consumer as expectedBytes and byte-verify after transfer.",
               },
               null,
               2
@@ -1015,6 +1161,172 @@ function buildServer() {
           },
         ],
       };
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // Notes (v0.6.0) — the firm's HISTORY / DEFICIENCY LOG note hygiene rules
+  // (notification-pause-note-hygiene) live on Clio Notes: ONE running HISTORY
+  // note per matter appended with terse dated lines, ONE DEFICIENCY LOG note
+  // per matter updated in place. Appending to the existing note is the easy
+  // path here by design: clio_list_notes → clio_update_note(appendLine).
+  // -------------------------------------------------------------------------
+
+  server.registerTool(
+    "clio_list_notes",
+    {
+      title: "List a Clio matter's notes",
+      description:
+        "List the notes on a Clio matter, optionally filtered by a case-insensitive subject substring (e.g. 'HISTORY' or 'DEFICIENCY LOG'). ALWAYS call this before clio_create_note — the firm rule is ONE running HISTORY note and ONE DEFICIENCY LOG note per matter, appended/updated in place via clio_update_note, never duplicated. Returns each note's id, subject, full detail, date, and timestamps. An empty result means the matter has no notes matching the filter — not that notes are unavailable.",
+      inputSchema: {
+        matterId: z.number().int().describe("The Clio matter ID"),
+        subjectContains: z
+          .string()
+          .optional()
+          .describe(
+            "Only return notes whose subject contains this text (case-insensitive), e.g. 'HISTORY'"
+          ),
+      },
+    },
+    async ({ matterId, subjectContains }) => {
+      // Clio's list-notes call needs type=Matter alongside matter_id — a
+      // missing type draws ParameterMissing, which reads like "no notes".
+      const params = new URLSearchParams({
+        type: "Matter",
+        matter_id: String(matterId),
+        fields: "id,subject,detail,date,created_at,updated_at",
+        limit: "200",
+        order: "date(asc)",
+      });
+      const data = await clioFetch(`/notes.json?${params.toString()}`);
+      let notes = data.data ?? [];
+      if (subjectContains) {
+        const needle = subjectContains.toLowerCase();
+        notes = notes.filter((n) => (n.subject ?? "").toLowerCase().includes(needle));
+      }
+      return { content: [{ type: "text", text: JSON.stringify(notes, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "clio_create_note",
+    {
+      title: "Create a note on a Clio matter",
+      description:
+        "Create a new note (type Matter) on a Clio matter. Call clio_list_notes first: if the matter already has a note with this subject (e.g. its running HISTORY note or DEFICIENCY LOG), APPEND to it with clio_update_note instead — the bridge refuses a same-subject duplicate unless allowDuplicateSubject is explicitly true. Returns the created note's id.",
+      inputSchema: {
+        matterId: z.number().int().describe("The Clio matter ID to attach the note to"),
+        subject: z
+          .string()
+          .max(255)
+          .describe("Note subject/title, e.g. 'HISTORY' or 'DEFICIENCY LOG'"),
+        detail: z
+          .string()
+          .describe(
+            "The note body. For a new HISTORY note, start with the first terse dated line, e.g. '8/5/26 — …'"
+          ),
+        date: z
+          .string()
+          .optional()
+          .describe("Note date, YYYY-MM-DD (defaults to today in Clio if omitted)"),
+        allowDuplicateSubject: z
+          .boolean()
+          .optional()
+          .describe(
+            "Set true ONLY to deliberately create a second note whose subject matches an existing note on the matter. Default false: the bridge blocks the duplicate and tells you to append instead (ONE HISTORY note per matter rule)."
+          ),
+      },
+    },
+    async ({ matterId, subject, detail, date, allowDuplicateSubject = false }) => {
+      if (!allowDuplicateSubject) {
+        const params = new URLSearchParams({
+          type: "Matter",
+          matter_id: String(matterId),
+          fields: "id,subject",
+          limit: "200",
+        });
+        const existing = await clioFetch(`/notes.json?${params.toString()}`);
+        const dup = (existing.data ?? []).find(
+          (n) => (n.subject ?? "").trim().toLowerCase() === subject.trim().toLowerCase()
+        );
+        if (dup) {
+          throw new Error(
+            `Matter ${matterId} already has a note with subject "${dup.subject}" (note id ${dup.id}). ` +
+              `Append to it with clio_update_note(noteId: ${dup.id}, appendLine: …) instead — the firm ` +
+              `rule is ONE running note per subject. Pass allowDuplicateSubject: true only if a second ` +
+              `note with this subject is genuinely intended.`
+          );
+        }
+      }
+      const body = {
+        data: {
+          type: "Matter",
+          subject,
+          detail,
+          matter: { id: matterId },
+          ...(date ? { date } : {}),
+        },
+      };
+      const result = await clioFetch(
+        `/notes.json?fields=id,subject,date,created_at`,
+        { method: "POST", body: JSON.stringify(body) }
+      );
+      return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "clio_update_note",
+    {
+      title: "Update a Clio note (append a line, or replace subject/body)",
+      description:
+        "Update an existing Clio note. THE COMMON CASE is appendLine: the bridge reads the note's current body and appends your line on a new line at the end — use this to add a terse dated line to a matter's running HISTORY note (read → append → PATCH, atomic from the caller's side). Alternatively pass detail to REPLACE the whole body (for DEFICIENCY LOG in-place rewrites where resolved items are removed) and/or subject to retitle. Provide appendLine OR detail, not both. Returns the updated note with its full new detail so the write can be verified.",
+      inputSchema: {
+        noteId: z.number().int().describe("The Clio note ID (from clio_list_notes)"),
+        appendLine: z
+          .string()
+          .optional()
+          .describe(
+            "A line to append to the end of the note's existing body on its own new line, e.g. '8/5/26 — TitlePro247 title work: …'"
+          ),
+        detail: z
+          .string()
+          .optional()
+          .describe(
+            "Full replacement body — REPLACES the note's entire detail. Use for DEFICIENCY LOG in-place updates; prefer appendLine for HISTORY notes."
+          ),
+        subject: z
+          .string()
+          .max(255)
+          .optional()
+          .describe("New subject, if the note should be retitled"),
+      },
+    },
+    async ({ noteId, appendLine, detail, subject }) => {
+      if (appendLine !== undefined && detail !== undefined) {
+        throw new Error("Provide appendLine OR detail, not both.");
+      }
+      if (appendLine === undefined && detail === undefined && subject === undefined) {
+        throw new Error("Nothing to update — provide appendLine, detail, and/or subject.");
+      }
+      const data = {};
+      if (appendLine !== undefined) {
+        const current = await clioFetch(
+          `/notes/${noteId}.json?fields=id,subject,detail`
+        );
+        const existingDetail = current.data?.detail ?? "";
+        data.detail = existingDetail
+          ? `${existingDetail.replace(/\s+$/, "")}\n${appendLine}`
+          : appendLine;
+      } else if (detail !== undefined) {
+        data.detail = detail;
+      }
+      if (subject !== undefined) data.subject = subject;
+      const result = await clioFetch(
+        `/notes/${noteId}.json?fields=id,subject,detail,date,updated_at`,
+        { method: "PATCH", body: JSON.stringify({ data }) }
+      );
+      return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
     }
   );
 
