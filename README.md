@@ -168,6 +168,14 @@ from then on.
   for full scans it should pass a pre-authenticated download URL as
   `sourceUrl` and let the bridge fetch the bytes itself.
 
+## Companion tools
+
+- `tools/wealthcounsel-login/` — a macOS program for the Mac mini that logs
+  Chrome into WealthCounsel with real OS-level mouse clicks, working around
+  Chrome's autofill nullification (page JavaScript cannot read or submit
+  autofilled credentials; only a genuine user gesture can). See its README
+  for one-time setup and usage.
+
 ## Local testing
 
 ```
