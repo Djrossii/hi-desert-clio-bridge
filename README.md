@@ -175,6 +175,10 @@ from then on.
   Chrome's autofill nullification (page JavaScript cannot read or submit
   autofilled credentials; only a genuine user gesture can). See its README
   for one-time setup and usage.
+- `tools/infotrack-reconnect/` — same engine aimed at the InfoTrack ↔ Clio
+  reconnect: drives the OAuth authorization popup (which browser-extension
+  automation cannot see) with physical clicks, completing sign-in, 2FA, and
+  consent, then reloads the Clio InfoTrack pane. See its README.
 
 ## Local testing
 
