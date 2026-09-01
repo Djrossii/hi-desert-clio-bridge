@@ -176,17 +176,19 @@ function probe(chrome, handle) {
   try { return JSON.parse(raw); } catch (e) { return null; }
 }
 
-function toScreen(m, r) {
+function toScreenAt(m, r, fx, fy) {
   var zoom = m.ow / m.iw;
   if (!(zoom > 0.4 && zoom < 4.0)) {
     fail(2, "Implausible zoom factor " + zoom.toFixed(2) + " - reset page zoom (Cmd+0) and retry.");
   }
   var chromeHeight = m.oh - m.ih * zoom;
   return {
-    x: m.sx + (r.x + r.w / 2) * zoom,
-    y: m.sy + chromeHeight + (r.y + r.h / 2) * zoom
+    x: m.sx + (r.x + r.w * fx) * zoom,
+    y: m.sy + chromeHeight + (r.y + r.h * fy) * zoom
   };
 }
+
+function toScreen(m, r) { return toScreenAt(m, r, 0.5, 0.5); }
 
 // ------------------------------------------------------------ chrome logic
 
@@ -355,9 +357,19 @@ function run(argv) {
 
   var deadline = Date.now() + TOTAL_TIMEOUT_SEC * 1000;
   var authWasSeen = false;
-  var lastConnectClick = 0;
+  var nextConnectAllowed = 0;
+  var everTriedConnect = false;
+  var frameAttempt = 0;
   var loginRounds = 0;
   var otpRounds = 0;
+
+  // Where to try clicking inside the InfoTrack iframe when the probe cannot
+  // see the button (cross-origin): the reconnect pane is a short message
+  // with the button near the top, so work down from upper-center. Fractions
+  // of the iframe's width/height.
+  var FRAME_CANDIDATES = [
+    [0.5, 0.20], [0.5, 0.35], [0.5, 0.50], [0.5, 0.12], [0.35, 0.25], [0.5, 0.65]
+  ];
 
   while (Date.now() < deadline) {
     var auth = findAuthTab(chrome, startIds);
@@ -402,25 +414,32 @@ function run(argv) {
 
     // No auth page yet: click Connect in the Clio InfoTrack pane.
     var clio = findClioInfoTrackTab(chrome);
-    if (clio && Date.now() - lastConnectClick > CONNECT_RECLICK_SEC * 1000) {
+    if (clio && Date.now() >= nextConnectAllowed) {
       focus(chrome, clio.handle);
       var cp = probe(chrome, clio.handle);
       if (cp && cp.connectBtn) {
         log("Clicking the Connect button in the Clio InfoTrack pane");
         clickKey(chrome, clio.handle, cp, "connectBtn");
-        lastConnectClick = Date.now();
+        everTriedConnect = true;
+        nextConnectAllowed = Date.now() + CONNECT_RECLICK_SEC * 1000;
       } else if (cp && cp.itFrame) {
         // The button lives inside InfoTrack's cross-origin iframe where the
-        // probe cannot see it; the pane is a single centered button, so
-        // click the iframe's center.
-        log("Connect button is inside the InfoTrack iframe - clicking the pane center");
-        clickKey(chrome, clio.handle, cp, "itFrame");
-        lastConnectClick = Date.now();
+        // probe cannot see it. Try a ladder of likely positions, one per
+        // pass, until the popup appears.
+        var cand = FRAME_CANDIDATES[Math.min(frameAttempt, FRAME_CANDIDATES.length - 1)];
+        var pt = toScreenAt(cp.metrics, cp.itFrame, cand[0], cand[1]);
+        log("Connect button is inside the InfoTrack iframe - trying position " +
+            (frameAttempt + 1) + " (" + cand[0] + ", " + cand[1] + ") at (" +
+            Math.round(pt.x) + ", " + Math.round(pt.y) + ")");
+        physicalClick(pt);
+        frameAttempt++;
+        everTriedConnect = true;
+        nextConnectAllowed = Date.now() + 8 * 1000; // short gap between ladder tries
       }
       delay(2);
       continue;
     }
-    if (!clio && !authWasSeen && lastConnectClick === 0) {
+    if (!clio && !authWasSeen && !everTriedConnect) {
       // Nothing to work with at all - say so early rather than spinning.
       fail(6, "No InfoTrack auth page open and no Clio tab showing the InfoTrack pane. " +
               "Open the matter in Clio, select the 'InfoTrack: File, Serve and Sync' tab, then re-run.");

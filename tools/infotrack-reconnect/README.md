@@ -30,10 +30,11 @@ in front of it:
 
 1. **Reconnect pane** (Clio matter tab): physically clicks the Connect
    button. If the button lives inside InfoTrack's cross-origin iframe
-   (where the read-only probe can't see it), it clicks the pane's center —
-   the pane is a single centered button. Then waits for the popup. Any
-   brand-new Chrome window that appears mid-run is treated as the auth
-   popup regardless of URL.
+   (where the read-only probe can't see it), it tries a ladder of likely
+   positions — upper-center first, working outward — one every ~8 seconds
+   until the popup appears. Then waits for the popup. Any brand-new Chrome
+   window that appears mid-run is treated as the auth popup regardless of
+   URL, so clicking Connect by hand while the tool runs also works.
 2. **Sign-in form**: real click on the username field commits Chrome's
    autofill (Down+Return fallback for the saved-credentials dropdown),
    then clicks Log In. Never types or reads a credential — autofill does
