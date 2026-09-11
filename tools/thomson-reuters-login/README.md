@@ -19,11 +19,22 @@ playbook, still standing five weeks later.
 The extension cannot screenshot the form, so it cannot see it; it cannot
 see it, so it cannot plain-click it. The documented procedure dead-ends.
 
+**Later on 9/11 the reason surfaced.** With the session signed out, a
+Claude-in-Chrome session sent to do research landed on the OnePass page
+and the extension raised its per-action prompt — *"Claude wants to read
+page content on: auth.thomsonreuters.com — Allow this action / Decline"*
+— carrying the line **"Site-level permissions are disabled for this
+site."** So the permission everyone spent the morning trying to grant is
+not grantable: on this host the extension asks a human for every single
+action. "Permission denied by user" is what that prompt becomes when no
+one is there to click Allow. The extension path through OnePass is
+human-in-the-loop by construction and cannot be made autonomous.
+
 **This program does not need that permission.** It drives Chrome from
 outside the browser entirely — the extension is not in the loop, so its
-site permissions are irrelevant to it. Granting the permission is still
-worth doing for interactive sessions; this is what unblocks the work in
-the meantime, and what keeps scheduled Mac-mini runs working regardless.
+site permissions are irrelevant to it. Once it has signed in, the
+extension works on `1.next.westlaw.com` and `cocounsel.thomsonreuters.com`
+— which are not the auth host — and never has to touch OnePass at all.
 
 ## What the permission does and does not fix
 
@@ -146,6 +157,22 @@ click (`autofilled: user=false` at page load is normal — Chrome commits
 on a gesture), and whether Accessibility trust is granted. The real run
 checks both and stops with a named fix if either is missing.
 
+### Live real runs, 9/11/2026
+
+Three real runs, same machine, same afternoon, each after a `git pull`:
+
+1. **Exit 3** on the first gesture sequence — Chrome offered nothing on
+   the click. Don Ross then signed in by hand, in the same profile, using
+   the credential Chrome offered *him*. So the credential was never the
+   problem.
+2. **Exit 3** again, now logging the window: `in window 1 of 1` — one
+   window, one profile. The gesture itself was wrong: Down and Return
+   were fired 150 ms apart, so Return submitted the empty form before
+   Chrome's suggestion list had drawn, and a second click was closing the
+   list the first had opened.
+3. **`OK: signed in`** on the paced sequence — click, 1.0 s; Down, 0.7 s;
+   Return, 0.8 s — as reported by Don Ross. Westlaw loaded.
+
 ## Usage
 
 ```bash
@@ -181,8 +208,15 @@ tokens go stale (westlaw-login-first, cocounsel-login-first).
 - **CoCounsel research still runs on the MCP.** This tool is for reading
   and for browser work; it does not change where queries are run, and it
   does not excuse failing to record the `chat_id`.
-- **Interactive Claude sessions are unchanged:** they keep using the
-  plain-click procedure in the login-first playbooks, which is what the
-  extension site permission would restore.
+- **Run this first, every burst.** Same pattern as `wc-login.sh` (Method
+  A in the WealthCounsel playbook): a session that will touch Westlaw or
+  CoCounsel runs `tr-login.sh` before any browser work and proceeds only
+  on exit 0. Exit 0 is cheap when already signed in. The extension's
+  plain-click procedure on OnePass is the fallback, and it needs Don Ross
+  at the keyboard to click *Allow this action* on every step.
+- **Cancel any Claude-in-Chrome action before running this.** The tool
+  reuses whatever tab is already on the OnePass host — which, when a
+  browser session has just hit the wall, is that session's own tab. Two
+  drivers on one tab is a coin toss.
 - This tool signs in only. It never files, submits, or transmits anything
   to a court, and never fabricates a citation or a result.
