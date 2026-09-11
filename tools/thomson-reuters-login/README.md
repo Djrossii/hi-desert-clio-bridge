@@ -59,19 +59,27 @@ sanctioned programmatic path is the CoCounsel MCP.
 
 **Where the real gap is.** Tested from the authoring session on 9/11
 (chat `01a09265-9287-7d88-8001-a40e9526f5e4`, a non-client question):
-`ask_cocounsel` returned only `backendUrl` and `runInProgress: false` — no
-answer, no `artifact_id`, no `version`. The server exposes no other tool
-for outputs; its only resources are two MCP Apps
-(`ui://cocounsel/ask.html`, `ui://cocounsel/upload.html`) whose CSP
-connects to `cocoagent-service.cocounsel.thomsonreuters.com`. The answer
-is delivered to that client-rendered widget, and `get_cocounsel_output`
-needs ids that only the widget surfaces. A session that does not render
-MCP Apps — this one, any headless or scheduled run — can start research
-and can never receive it. That is the 9/7 failure's mechanism. It is the
-vendor's to fix: an output-listing tool, or ids in the ask response.
-Until then, capture is an attended step — a client that renders the
-widget, or a person at the chat URL — and this tool's job is to make sure
-the sign-in is never what stops them.
+`ask_cocounsel` returned at once with only `backendUrl` and
+`runInProgress: false` — no answer, no `artifact_id`, no `version`. The
+server exposes no tool that lists or returns outputs; its only resources
+are two MCP Apps (`ui://cocounsel/ask.html`, `ui://cocounsel/upload.html`)
+whose CSP connects to `cocoagent-service.cocounsel.thomsonreuters.com`.
+The answer is delivered into that client-rendered widget, and
+`get_cocounsel_output` needs ids that only the widget's context surfaces.
+
+Two records to hold together. The firm's CoCounsel playbook records a
+full MCP round trip on 9/4/2026 — widget context returned the cited
+answer, `get_cocounsel_output` returned the artifact — with the note that
+the run is asynchronous, took about ten minutes, and *"wait for
+`finished: true` before concluding anything is broken."* This Claude Code
+session received nothing in well over ten minutes. So: the answer reaches
+a client that renders the widget and waits; it has not been shown to reach
+one that does not. A first draft of this paragraph said "can never
+receive it" after waiting under a minute — that was too strong, and is
+withdrawn. The vendor could close the gap for every client with an
+output-listing tool or ids in the ask response. Until then, capture is an
+attended step in a widget-rendering client, or a person at the chat URL —
+and this tool's job is to make sure sign-in is never what stops them.
 
 ## What the permission does and does not fix
 
