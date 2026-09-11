@@ -225,6 +225,13 @@ var PROBE_JS = "(function () {\n" +
   "  function visible(el) {\n" +
   "    return !!(el && el.offsetParent !== null && !el.disabled);\n" +
   "  }\n" +
+  "  function describe(el) {\n" +
+  "    if (!el) return null;\n" +
+  "    return el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') +\n" +
+  "      '[name=' + (el.name || '') + ' type=' + (el.type || '') +\n" +
+  "      ' ac=' + (el.getAttribute('autocomplete') || '') +\n" +
+  "      ' ph=' + (el.placeholder || '').slice(0, 30) + ']';\n" +
+  "  }\n" +
   "  var pass = document.querySelector('input[type=password]');\n" +
   "  if (!visible(pass)) pass = null;\n" +
   "  var otp = document.querySelector(\n" +
@@ -252,6 +259,9 @@ var PROBE_JS = "(function () {\n" +
   "    if (/log\\s*in|sign\\s*in|continue|next|submit|verify/i.test(t)) { btn = vis[j]; break; }\n" +
   "  }\n" +
   "  if (!btn && vis.length === 1) btn = vis[0];\n" +
+  "  var ae = document.activeElement;\n" +
+  "  var activeKey = ae === user ? 'user' : ae === pass ? 'pass' : ae === otp ? 'otp' :\n" +
+  "    (ae && ae.tagName ? ae.tagName.toLowerCase() : 'none');\n" +
   "  return JSON.stringify({\n" +
   "    href: location.href,\n" +
   "    metrics: { sx: window.screenX, sy: window.screenY,\n" +
@@ -262,6 +272,8 @@ var PROBE_JS = "(function () {\n" +
   "    userFilled: !!(user && user.value.length),\n" +
   "    passFilled: !!(pass && pass.value.length),\n" +
   "    otpFilled: !!(otp && otp.value.length),\n" +
+  "    hasFocus: document.hasFocus(), activeKey: activeKey,\n" +
+  "    userDesc: describe(user), passDesc: describe(pass),\n" +
   "    user: rect(user), pass: rect(pass), otp: rect(otp), btn: rect(btn)\n" +
   "  });\n" +
   "})();";
@@ -297,6 +309,16 @@ function toScreen(m, r) {
     x: m.sx + (r.x + r.w / 2) * zoom,
     y: m.sy + chromeHeight + (r.y + r.h / 2) * zoom
   };
+}
+
+// What the probe found and where the window is - enough to check a click
+// position by hand against the screen. Nothing here is a field's value.
+function logFields(p) {
+  var m = p.metrics;
+  log("Fields: user=" + (p.userDesc || "none") + " pass=" + (p.passDesc || "none") +
+      " | focus: page=" + p.hasFocus + " on='" + p.activeKey + "'");
+  log("Window: screen(" + m.sx + "," + m.sy + ") inner " + m.iw + "x" + m.ih +
+      " outer " + m.ow + "x" + m.oh + " zoom " + (m.ow / m.iw).toFixed(2));
 }
 
 // Physically click an element (by probe key), re-probing first so the
@@ -350,17 +372,47 @@ function waitForChange(chrome, handle, fromKind, fromHref) {
 // if Chrome staged an autofill preview instead of committing it.
 // Returns the latest probe. Never reads the value - only the filled flag.
 function commitAutofill(chrome, handle, fieldKey, filledKey) {
+  // 1. One real click, then a full second: on some forms focus alone
+  //    commits the saved value, and Chrome's suggestion list takes time
+  //    to draw. If this click did not focus the field, the problem is
+  //    geometry, not autofill - stop here rather than fire keystrokes
+  //    into whatever does have focus.
   clickElement(chrome, handle, fieldKey);
-  delay(0.5);
+  delay(1.0);
   var p = probe(chrome, handle);
+  var landed = (p.activeKey === fieldKey);
+  log("  after click: page focus=" + p.hasFocus + " on '" + p.activeKey +
+      "', " + filledKey + "=" + p[filledKey]);
+  p.landed = landed;
+  if (p[filledKey] || !landed) return p;
+
+  // 2. Field is focused. Down opens the suggestion list; give it time to
+  //    draw before Return takes the first entry. Fired back-to-back, Return
+  //    arrives before the list exists and submits the empty form instead.
+  //    No second click here - clicking a field whose list is open closes it.
+  keyTap(KEY_DOWN_ARROW);
+  delay(0.7);
+  keyTap(KEY_RETURN);
+  delay(0.8);
+  p = probe(chrome, handle);
+  p.landed = landed;
+  log("  after Down, Return: focus on '" + p.activeKey + "', " +
+      filledKey + "=" + p[filledKey]);
   if (p[filledKey]) return p;
 
-  log("Autofill not committed yet - selecting from the dropdown");
+  // 3. Some forms only offer the list on a click of an already-focused
+  //    field. Click again, then the same paced keys.
   clickElement(chrome, handle, fieldKey);
+  delay(1.0);
   keyTap(KEY_DOWN_ARROW);
+  delay(0.7);
   keyTap(KEY_RETURN);
-  delay(0.6);
-  return probe(chrome, handle);
+  delay(0.8);
+  p = probe(chrome, handle);
+  p.landed = landed;
+  log("  after click, Down, Return: focus on '" + p.activeKey + "', " +
+      filledKey + "=" + p[filledKey]);
+  return p;
 }
 
 function submitStep(chrome, handle, fallbackFieldKey, p) {
@@ -394,6 +446,7 @@ function run(argv) {
 
   var p = probe(chrome, handle);
   log("Page: " + p.href);
+  logFields(p);
   var kind = classify(p);
 
   if (dryRun) {
@@ -447,9 +500,15 @@ function run(argv) {
     if (kind === "username") {
       p = commitAutofill(chrome, handle, "user", "userFilled");
       if (!p.userFilled) {
-        fail(3, "Chrome autofill did not populate the OnePass username field. " +
-                "Check that the Thomson Reuters credential is saved in Chrome / " +
-                "Apple Passwords and that its autofill extension is on. " +
+        if (!p.landed) {
+          fail(2, "The click did not land on the username field - afterwards " +
+                  "focus was on '" + p.activeKey + "' (page focused: " +
+                  p.hasFocus + "). Geometry, not autofill: compare the Window " +
+                  "line above with where the field really is (second display? " +
+                  "page zoom not 100%? Chrome in full-screen?).");
+        }
+        fail(3, "The click focused the username field, but Chrome offered no " +
+                "saved entry on click, Down+Return, or click+Down+Return. " +
                 "Not guessing or retrying further (lockout risk).");
       }
       log("Username committed by autofill.");
@@ -457,22 +516,29 @@ function run(argv) {
 
     } else if (kind === "password") {
       p = commitAutofill(chrome, handle, "pass", "passFilled");
-      if (!p.passFilled) {
+      if (!p.passFilled && p.landed && p.user) {
         // One more gesture, this time starting from the username field -
-        // some OnePass renders only offer the dropdown from there.
-        if (p.user) {
-          clickElement(chrome, handle, "user");
-          keyTap(KEY_DOWN_ARROW);
-          keyTap(KEY_RETURN);
-          delay(0.6);
-          p = probe(chrome, handle);
-        }
+        // some OnePass renders only offer the list from there. Same pacing.
+        var landed = p.landed;
+        clickElement(chrome, handle, "user");
+        delay(1.0);
+        keyTap(KEY_DOWN_ARROW);
+        delay(0.7);
+        keyTap(KEY_RETURN);
+        delay(0.8);
+        p = probe(chrome, handle);
+        p.landed = landed;
+        log("  after user-field click, Down, Return: passFilled=" + p.passFilled);
       }
       if (!p.passFilled) {
-        fail(3, "Chrome autofill did not populate the OnePass password field. " +
-                "Check that the Thomson Reuters credential is saved in Chrome / " +
-                "Apple Passwords and that its autofill extension is on. " +
-                "Not guessing or retrying further (lockout risk).");
+        if (!p.landed) {
+          fail(2, "The click did not land on the password field - afterwards " +
+                  "focus was on '" + p.activeKey + "' (page focused: " +
+                  p.hasFocus + "). Geometry, not autofill.");
+        }
+        fail(3, "The click focused the password field, but Chrome offered no " +
+                "saved entry on any gesture. Not guessing or retrying further " +
+                "(lockout risk).");
       }
       log("Password committed by autofill (never read by this program).");
       submitStep(chrome, handle, "pass", p);
