@@ -32,9 +32,22 @@ human-in-the-loop by construction and cannot be made autonomous.
 
 **This program does not need that permission.** It drives Chrome from
 outside the browser entirely — the extension is not in the loop, so its
-site permissions are irrelevant to it. Once it has signed in, the
-extension works on `1.next.westlaw.com` and `cocounsel.thomsonreuters.com`
-— which are not the auth host — and never has to touch OnePass at all.
+site permissions are irrelevant to it. Signing in is therefore solved
+unattended.
+
+**Reading is not, yet.** Minutes later, with the session signed in by
+this tool, the same extension session prompted again — *"Claude wants to
+read page content on: cocounsel.thomsonreuters.com"* — with the same
+line: **"Site-level permissions are disabled for this site."** So
+per-action approval is not confined to the auth host; it applies to the
+CoCounsel host too (not yet seen on Westlaw). Whether that is a category
+rule inside the extension or a setting that can be changed is a question
+for the extension's own settings page, which the dialog points to and
+which had not yet been opened when this was written. Until it is
+answered, the extension can read a Thomson Reuters page only with a human
+clicking Allow for each action. The Apple-Events channel this tool uses
+for its read-only probe could read a signed-in page with no extension and
+no prompt; that is the obvious companion, and it is not in this change.
 
 ## What the permission does and does not fix
 
