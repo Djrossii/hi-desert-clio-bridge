@@ -10,15 +10,17 @@
 //
 // Two things make this its own program:
 //
-//   1. OnePass is a MULTI-STEP form. Step 1 is username + Continue, with no
-//      password field on the page at all; the password step renders only
-//      after Continue. A single-shot "find the password field and submit"
-//      pass never sees step 1.
-//   2. "Already authenticated?" cannot be decided by a "/login" path
-//      marker - OnePass sign-in URLs on auth.thomsonreuters.com carry no
-//      such segment. This program decides it by HOST instead: if the tab
-//      is still on a Thomson Reuters auth host, it is not signed in,
-//      whatever the path says.
+//   1. OnePass is a MULTI-STEP form. Step 1 is username + Sign in, with no
+//      password field on the page at all (live-verified 9/11/2026); the
+//      password step renders only after that. A single-shot "find the
+//      password field and submit" pass never sees step 1.
+//   2. "Already authenticated?" should not be decided by a "/login" path
+//      marker. The identifier step happens to carry one
+//      (/u/login/identifier), but OnePass runs on Auth0 Universal Login,
+//      whose later screens (MFA) need not - a step there with an
+//      unrecognized field would read as "signed in". This program decides
+//      by HOST instead: a tab still on a Thomson Reuters auth host is not
+//      signed in, whatever the path says.
 //
 // Because this runs OUTSIDE the browser as OS-level input, the
 // Claude-in-Chrome extension's missing site permission on
@@ -50,6 +52,7 @@
 "use strict";
 
 ObjC.import("CoreGraphics");
+ObjC.import("ApplicationServices"); // AXIsProcessTrusted
 ObjC.import("stdlib");
 
 // ---------------------------------------------------------------- constants
@@ -300,8 +303,10 @@ function clickElement(chrome, handle, key) {
 // ------------------------------------------------------------ step machine
 
 // Which OnePass step (if any) is on screen. Deliberately host-based for the
-// "authenticated" verdict: a path marker like "/login" does not appear in
-// OnePass URLs, so keying off one reports a false success on step 1.
+// "authenticated" verdict: the identifier step's path does contain "/login"
+// (/u/login/identifier, seen live), but Auth0's later screens need not, and
+// a path marker would call an unrecognized one "signed in". The host cannot
+// lie about that.
 function classify(p) {
   if (p.hasOtp) return "otp";
   if (p.hasPass) return "password";
@@ -394,6 +399,17 @@ function run(argv) {
   if (kind === "authenticated") {
     log("OK: already authenticated - no OnePass step present (" + p.href + ").");
     $.exit(0);
+  }
+
+  // CGEvents posted without Accessibility trust are silently dropped - the
+  // run would then time out on every step and report a misleading exit 5.
+  // Check once, up front, and name the fix. (The dry run above never
+  // clicks, so it deliberately does not need this.)
+  if (!$.AXIsProcessTrusted()) {
+    fail(2, "This process is not trusted for Accessibility, so its clicks " +
+            "would be silently dropped. System Settings > Privacy & Security > " +
+            "Accessibility: enable the app running this script (Terminal, or " +
+            "the launchd runner), then re-run.");
   }
 
   focusTab(chrome, handle);

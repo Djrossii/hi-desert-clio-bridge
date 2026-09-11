@@ -10,11 +10,11 @@ aimed at Thomson Reuters OnePass.
 
 The Claude-in-Chrome extension has **no site permission on
 `auth.thomsonreuters.com`**, the OnePass host both Westlaw and CoCounsel
-sign in through. Re-verified live **9/11/2026**: `1.next.westlaw.com`
-redirected to OnePass (session expired) and both `get_page_text` and
-`screenshot` returned *"Permission denied by user"*. This is the same wall
-recorded on 8/6/2026 in the westlaw-login-first playbook, still standing
-five weeks later.
+sign in through. Re-tested live by Don Ross on **9/11/2026**:
+`1.next.westlaw.com` redirected to OnePass (session expired) and both
+`get_page_text` and `screenshot` returned *"Permission denied by user"*.
+This is the same wall recorded on 8/6/2026 in the westlaw-login-first
+playbook, still standing five weeks later.
 
 The extension cannot screenshot the form, so it cannot see it; it cannot
 see it, so it cannot plain-click it. The documented procedure dead-ends.
@@ -51,26 +51,33 @@ Two corrections to the 9/11 read, both from the canonical playbooks:
 probe is generic. That generalization does **not** reach OnePass, for two
 structural reasons:
 
-1. **OnePass is a two-step form.** Step 1 is username + *Continue*, with
+1. **OnePass is a two-step form.** Step 1 is username + *Sign in*, with
    no password field on the page at all; the password step renders only
-   after Continue. A single-shot "find the password field, submit it" pass
-   never sees step 1.
-2. **Its "already authenticated?" test is a `/login` path marker.** OnePass
-   URLs carry no such segment, so the test misfires.
+   after that. Live-verified 9/11/2026 on the identifier step:
+   `user=true pass=false otp=false btn=true ('Sign in')`. A single-shot
+   "find the password field, submit it" pass never sees step 1 —
+   `wc-login.sh` stops there with exit 2, *"found no password field"*.
+2. **Its "already authenticated?" test is a `/login` path marker.** That
+   happens to hold on the identifier step (`/u/login/identifier`), which
+   is why the failure above is a loud stop rather than a silent one. It
+   need not hold on OnePass's later screens: the `/u/login/identifier`
+   path and `state=` token mark this as Auth0 Universal Login, whose MFA
+   challenge is not served under `/login` (not yet observed live on this
+   account). A step there whose code field the probe did not recognize
+   would be reported as *"already authenticated"*, exit 0 — a silent
+   false success.
 
-Together those two produce a **silent false success** — the worst failure
-mode available. Pointed at Westlaw, `wc-login.sh` reports *"already
-authenticated"* and exits 0 while sitting on the OnePass username form.
-Classifier comparison, run against representative page shapes:
+Classifier comparison — the identifier row from the live URL, the rest
+from representative shapes:
 
 | Page in front of the tool | `wc-login.sh` | `tr-login.sh` |
 |---|---|---|
-| OnePass step 1 (username) | **authenticated, exit 0** | `username` |
+| OnePass step 1 (username) — live | exit 2, cannot proceed | `username` |
 | OnePass step 2 (password) | proceeds | `password` |
 | OnePass 2FA | proceeds | `otp` |
 | Westlaw, signed in | authenticated, exit 0 | `authenticated` |
 | CoCounsel MCP chat page | authenticated, exit 0 | `authenticated` |
-| OnePass, shape unrecognized | **authenticated, exit 0** | `auth-unknown` (exit 2) |
+| OnePass MFA, code field unrecognized | **authenticated, exit 0** | `auth-unknown` (exit 2) |
 
 This program decides "signed in" by **host** instead: a tab still on a
 Thomson Reuters auth host is mid-sign-in, whatever its path says.
@@ -84,7 +91,8 @@ looking again:
 1. **Username step** — physically clicks the field. That one real gesture
    makes Chrome commit its autofill preview into real values; if the click
    opens the saved-credentials dropdown instead, it selects the first entry
-   with real Down-arrow + Return taps. Then clicks **Continue**.
+   with real Down-arrow + Return taps. Then clicks **Sign in** (that is the
+   identifier step's label on this site, not *Continue*).
 2. **Password step** — same gesture, then **Sign in**.
 3. **2FA screen** — clicks the code field so Apple Passwords can autofill,
    then Verify. If the code does not autofill it **stops**; codes are never
@@ -117,6 +125,27 @@ Verify without clicking anything:
 It reports which OnePass step it sees and whether autofill has values
 staged.
 
+### Live dry-run, 9/11/2026
+
+Run by Don Ross on the Mac mini — the tool's first run there, with no
+setup beyond what the WealthCounsel tool already needed:
+
+```
+[tr-login] Opening new tab: https://1.next.westlaw.com/
+[tr-login] Page: https://auth.thomsonreuters.com/u/login/identifier?state=…&ui_locales=en
+[tr-login] DRY RUN - step looks like: username
+[tr-login] DRY RUN - found: user=true pass=false otp=false btn=true ('Sign in') | autofilled: user=false pass=false
+[tr-login] DRY RUN - no clicks performed.
+```
+
+What it establishes: Apple-Events JavaScript is on; the Westlaw entry URL
+bounces to the OnePass identifier step; that step has no password field;
+the probe finds the username field and the *Sign in* button. What it does
+not establish: whether Chrome offers the saved OnePass credential on a
+click (`autofilled: user=false` at page load is normal — Chrome commits
+on a gesture), and whether Accessibility trust is granted. The real run
+checks both and stops with a named fix if either is missing.
+
 ## Usage
 
 ```bash
@@ -134,7 +163,7 @@ tokens go stale (westlaw-login-first, cocounsel-login-first).
 | Code | Meaning |
 |------|---------|
 | 0 | Signed in, or already authenticated |
-| 2 | Setup problem (Apple-Events JS off, unrecognized OnePass page shape, odd zoom) |
+| 2 | Setup problem (Apple-Events JS off, Accessibility not granted, unrecognized OnePass page shape, odd zoom) — the message names which |
 | 3 | Chrome autofill did not populate the credential — check the saved password; the tool does **not** guess or hammer retries (lockout risk) |
 | 4 | 2FA field present but Apple Passwords did not autofill the code |
 | 5 | Submitted but OnePass still shows a sign-in step — stopped (lockout risk) |
