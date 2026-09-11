@@ -45,9 +45,33 @@ rule inside the extension or a setting that can be changed is a question
 for the extension's own settings page, which the dialog points to and
 which had not yet been opened when this was written. Until it is
 answered, the extension can read a Thomson Reuters page only with a human
-clicking Allow for each action. The Apple-Events channel this tool uses
-for its read-only probe could read a signed-in page with no extension and
-no prompt; that is the obvious companion, and it is not in this change.
+clicking Allow for each action.
+
+Two things were considered and rejected the same day, and are recorded
+here so they are not proposed again: an auto-approver that clicks Allow
+on the extension's prompt for named hosts, and a reader that pulls the
+signed-in page's text over the Apple-Events channel this tool's probe
+uses. Both have the same effect — the AI reads Thomson Reuters content
+with no human saying yes — through a different door. The extension's rule
+is about that effect, not the door. The reader is also automated retrieval
+from Thomson Reuters web properties, which their terms restrict; their
+sanctioned programmatic path is the CoCounsel MCP.
+
+**Where the real gap is.** Tested from the authoring session on 9/11
+(chat `01a09265-9287-7d88-8001-a40e9526f5e4`, a non-client question):
+`ask_cocounsel` returned only `backendUrl` and `runInProgress: false` — no
+answer, no `artifact_id`, no `version`. The server exposes no other tool
+for outputs; its only resources are two MCP Apps
+(`ui://cocounsel/ask.html`, `ui://cocounsel/upload.html`) whose CSP
+connects to `cocoagent-service.cocounsel.thomsonreuters.com`. The answer
+is delivered to that client-rendered widget, and `get_cocounsel_output`
+needs ids that only the widget surfaces. A session that does not render
+MCP Apps — this one, any headless or scheduled run — can start research
+and can never receive it. That is the 9/7 failure's mechanism. It is the
+vendor's to fix: an output-listing tool, or ids in the ask response.
+Until then, capture is an attended step — a client that renders the
+widget, or a person at the chat URL — and this tool's job is to make sure
+the sign-in is never what stops them.
 
 ## What the permission does and does not fix
 
