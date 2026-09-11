@@ -145,6 +145,14 @@ function matchesAny(url, markers) {
   return false;
 }
 
+// Window title for the log - the only handle a human has for telling
+// Chrome windows (and profiles) apart when the wrong one gets the click.
+function windowLabel(win) {
+  var t = "";
+  try { t = win.name() || ""; } catch (e) {}
+  return "\"" + t.slice(0, 60) + "\"";
+}
+
 // Find an existing tab on the target host OR anywhere in the OnePass /
 // Westlaw / CoCounsel family - a tab that has already bounced to the auth
 // host is the tab we want, not a reason to open a second one.
@@ -158,6 +166,7 @@ function findOrOpenTab(chrome, url, markers) {
       try { u = tabs[ti].url() || ""; } catch (e) { u = ""; }
       if (u && matchesAny(u, markers)) {
         log("Reusing existing tab: " + u);
+        log("  in window " + (wi + 1) + " of " + wins.length + ": " + windowLabel(wins[wi]));
         return { win: wins[wi], tabIndex: ti + 1 };
       }
     }
@@ -172,6 +181,7 @@ function findOrOpenTab(chrome, url, markers) {
     return { win: win, tabIndex: 1 };
   }
   win = chrome.windows[0];
+  log("  in the frontmost of " + wins.length + " Chrome window(s): " + windowLabel(win));
   win.tabs.push(chrome.Tab({ url: url }));
   return { win: win, tabIndex: win.tabs.length };
 }
