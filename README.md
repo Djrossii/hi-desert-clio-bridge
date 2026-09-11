@@ -179,6 +179,13 @@ from then on.
   reconnect: drives the OAuth authorization popup (which browser-extension
   automation cannot see) with physical clicks, completing sign-in, 2FA, and
   consent, then reloads the Clio InfoTrack pane. See its README.
+- `tools/thomson-reuters-login/` — same engine aimed at Thomson Reuters
+  OnePass, the shared sign-in for Westlaw and CoCounsel. The Claude-in-Chrome
+  extension has no site permission on `auth.thomsonreuters.com`, so it cannot
+  screenshot the form and therefore cannot click it; this program drives
+  Chrome from outside the browser, where that permission does not apply. It
+  handles OnePass's two-step (username → password) form, which the
+  WealthCounsel tool structurally cannot. See its README.
 
 ## Local testing
 

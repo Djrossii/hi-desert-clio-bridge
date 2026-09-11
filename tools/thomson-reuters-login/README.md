@@ -1,0 +1,159 @@
+# Thomson Reuters login — OnePass sign-in without the extension
+
+Signs the Mac mini's Chrome into **Westlaw** and **CoCounsel** by posting
+real, OS-level mouse clicks and key taps (CoreGraphics `CGEvent`s through
+the HID event tap). Third member of the physical-click family, after
+`../wealthcounsel-login/` and `../infotrack-reconnect/` — same engine,
+aimed at Thomson Reuters OnePass.
+
+## Why this exists
+
+The Claude-in-Chrome extension has **no site permission on
+`auth.thomsonreuters.com`**, the OnePass host both Westlaw and CoCounsel
+sign in through. Re-verified live **9/11/2026**: `1.next.westlaw.com`
+redirected to OnePass (session expired) and both `get_page_text` and
+`screenshot` returned *"Permission denied by user"*. This is the same wall
+recorded on 8/6/2026 in the westlaw-login-first playbook, still standing
+five weeks later.
+
+The extension cannot screenshot the form, so it cannot see it; it cannot
+see it, so it cannot plain-click it. The documented procedure dead-ends.
+
+**This program does not need that permission.** It drives Chrome from
+outside the browser entirely — the extension is not in the loop, so its
+site permissions are irrelevant to it. Granting the permission is still
+worth doing for interactive sessions; this is what unblocks the work in
+the meantime, and what keeps scheduled Mac-mini runs working regardless.
+
+## What the permission does and does not fix
+
+Two corrections to the 9/11 read, both from the canonical playbooks:
+
+- **Westlaw** — the permission gap is real and is the blocker. Confirmed.
+- **CoCounsel MCP output** — the host to reach is
+  **`cocounsel.thomsonreuters.com/cocoagent/chat/{chat_id}`**, the page,
+  not `cocoagent-service.cocounsel.thomsonreuters.com`, which is the
+  backend service the page calls. Site permission on the service host
+  does not make research readable. Per cocounsel-login-first (amended
+  9/7/2026), MCP-created chats never appear in History and are reachable
+  **only** at that `/cocoagent/chat/` URL.
+- **The 9/7 failure was not this.** Its recorded root cause is an
+  unrecorded `chat_id` — with History not listing MCP chats, a chat whose
+  id was never captured cannot be found by anyone — compounded by
+  `get_cocounsel_output` often having no results view pushed to it. A
+  permission grant would not have saved those four runs. Recording the
+  `chat_id` the moment `start_cocounsel_chat` returns is what does
+  (research-must-be-findable).
+
+## Why the WealthCounsel tool is not enough
+
+`wc-login.sh` takes an arbitrary URL, and its README says the page-shape
+probe is generic. That generalization does **not** reach OnePass, for two
+structural reasons:
+
+1. **OnePass is a two-step form.** Step 1 is username + *Continue*, with
+   no password field on the page at all; the password step renders only
+   after Continue. A single-shot "find the password field, submit it" pass
+   never sees step 1.
+2. **Its "already authenticated?" test is a `/login` path marker.** OnePass
+   URLs carry no such segment, so the test misfires.
+
+Together those two produce a **silent false success** — the worst failure
+mode available. Pointed at Westlaw, `wc-login.sh` reports *"already
+authenticated"* and exits 0 while sitting on the OnePass username form.
+Classifier comparison, run against representative page shapes:
+
+| Page in front of the tool | `wc-login.sh` | `tr-login.sh` |
+|---|---|---|
+| OnePass step 1 (username) | **authenticated, exit 0** | `username` |
+| OnePass step 2 (password) | proceeds | `password` |
+| OnePass 2FA | proceeds | `otp` |
+| Westlaw, signed in | authenticated, exit 0 | `authenticated` |
+| CoCounsel MCP chat page | authenticated, exit 0 | `authenticated` |
+| OnePass, shape unrecognized | **authenticated, exit 0** | `auth-unknown` (exit 2) |
+
+This program decides "signed in" by **host** instead: a tab still on a
+Thomson Reuters auth host is mid-sign-in, whatever its path says.
+
+## What it does
+
+A bounded step machine (up to 8 screens) that handles whichever OnePass
+step is in front of it, then waits for that step to give way before
+looking again:
+
+1. **Username step** — physically clicks the field. That one real gesture
+   makes Chrome commit its autofill preview into real values; if the click
+   opens the saved-credentials dropdown instead, it selects the first entry
+   with real Down-arrow + Return taps. Then clicks **Continue**.
+2. **Password step** — same gesture, then **Sign in**.
+3. **2FA screen** — clicks the code field so Apple Passwords can autofill,
+   then Verify. If the code does not autofill it **stops**; codes are never
+   relayed by hand.
+4. **Done** — exits 0 once the tab is off the auth host.
+
+A step that does not advance within 20s is a **stop**, never a re-submit:
+repeated submits are how accounts get locked out.
+
+The only in-page JavaScript is a read-only probe returning element
+**geometry, the URL, a button's visible label, and filled/empty
+booleans**. No credential value is ever read, typed, stored, logged, or
+returned. Autofill does the filling; this program supplies only the
+gestures Chrome insists on.
+
+## One-time setup on the Mac mini
+
+Identical to the WealthCounsel tool — already done if that one runs. See
+`../wealthcounsel-login/README.md`: Chrome **View → Developer → Allow
+JavaScript from Apple Events**; **Accessibility** and **Automation**
+permission for whatever runs it; the OnePass credential saved for autofill
+per the credential-handling playbook.
+
+Verify without clicking anything:
+
+```bash
+./tr-login.sh --dry-run
+```
+
+It reports which OnePass step it sees and whether autofill has values
+staged.
+
+## Usage
+
+```bash
+./tr-login.sh                 # Westlaw, via https://1.next.westlaw.com/
+./tr-login.sh --cocounsel     # CoCounsel (same OnePass identity)
+./tr-login.sh --dry-run       # probe only, no clicks
+./tr-login.sh https://...     # another entry URL
+```
+
+Always the clean entry URL, never a saved signon URL — one-time trace
+tokens go stale (westlaw-login-first, cocounsel-login-first).
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Signed in, or already authenticated |
+| 2 | Setup problem (Apple-Events JS off, unrecognized OnePass page shape, odd zoom) |
+| 3 | Chrome autofill did not populate the credential — check the saved password; the tool does **not** guess or hammer retries (lockout risk) |
+| 4 | 2FA field present but Apple Passwords did not autofill the code |
+| 5 | Submitted but OnePass still shows a sign-in step — stopped (lockout risk) |
+| 6 | Timed out waiting for the page to load |
+| 64 | Not macOS (this must run on the Mac mini) |
+
+## Notes and boundaries
+
+- **Screen state:** the clicks are physical, so the Mac mini must be
+  unlocked and nobody should be moving the mouse while it runs.
+  Multi-display and non-100% zoom are handled (geometry is scaled by the
+  measured zoom factor); Cmd+0 is the well-tested path.
+- **Sessions expire silently.** Re-check at the start of each burst of
+  work, not once per session. Exit 0 is cheap when already authenticated.
+- **CoCounsel research still runs on the MCP.** This tool is for reading
+  and for browser work; it does not change where queries are run, and it
+  does not excuse failing to record the `chat_id`.
+- **Interactive Claude sessions are unchanged:** they keep using the
+  plain-click procedure in the login-first playbooks, which is what the
+  extension site permission would restore.
+- This tool signs in only. It never files, submits, or transmits anything
+  to a court, and never fabricates a citation or a result.
